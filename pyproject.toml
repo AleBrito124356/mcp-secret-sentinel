@@ -1,0 +1,12 @@
+[project]
+name = "mcp-secret-sentinel"
+version = "0.1.0"
+description = "MCP server that scans code for exposed secrets — API keys, tokens, private keys and high-entropy strings — with placeholder-aware allowlisting and redacted reports."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Alejandro Brito", email = "alejandrobritoolivera@gmail.com"}]
+dependencies = ["mcp>=1.2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
