@@ -3,12 +3,12 @@
 Wiring only: every tool delegates to core.py, which is pure stdlib and
 unit-tested without the mcp package installed.
 
-Run over stdio:  python server.py
+Run over stdio:  mcp-secret-sentinel  (or python -m mcp_secret_sentinel.server)
 """
 
 from mcp.server.fastmcp import FastMCP
 
-import core
+from . import core
 
 mcp = FastMCP("mcp-secret-sentinel")
 
@@ -125,5 +125,10 @@ def list_patterns() -> dict:
     return core.list_patterns()
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the console script."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

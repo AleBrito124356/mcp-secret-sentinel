@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import core  # noqa: E402  (path set up above)
+from mcp_secret_sentinel import core  # noqa: E402  (path set up above)
 
 # ---------------------------------------------------------------------------
 # Runtime-built fixtures (concatenation only — see module docstring)
