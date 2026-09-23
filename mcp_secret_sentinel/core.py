@@ -453,6 +453,19 @@ def _finding(source: str, line_no: int, hit: dict, commit: str | None = None) ->
     return entry
 
 
+def _split_lines(text: str) -> list[str]:
+    """Split on "\\n" only, dropping a trailing "\\r" from each line.
+
+    str.splitlines() also breaks on \\f, \\v, \\x1c-\\x1e, \\x85, U+2028 and
+    U+2029, which neither git nor editors count as line breaks, so every
+    such character would shift the reported line numbers.
+    """
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
+
+
 def _scan_text_lines(text: str, source: str, commit: str | None = None) -> list[dict]:
     findings: list[dict] = []
     for line_no, line in enumerate(text.splitlines(), start=1):
@@ -675,8 +688,58 @@ def scan_directory(path: str, max_files: int = 500) -> dict:
 # Git-based scanning
 # ---------------------------------------------------------------------------
 
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _COMMIT_RE = re.compile(r"^commit ([0-9a-f]{6,40})\b")
+_BINARY_RE = re.compile(r"^Binary files (.+) and (.+) differ$")
+
+# Config that is forced on every git call. User and repository config must not
+# change what we parse or make git run programs. Each entry is here for a reason:
+#   core.quotePath=false     non-ASCII paths come out as UTF-8, not "\303\263"
+#   core.fsmonitor=false     the fsmonitor hook is a configurable command
+#   diff.noprefix / diff.mnemonicPrefix / diff.relative
+#                            paths stay "b/<repo-relative path>" for the whole repo
+#   diff.suppressBlankEmpty  an empty line is never a context line
+#   diff.submodule=short     submodule changes stay one "Subproject commit" line
+#   log.showSignature=false  verifying signatures runs gpg.program
+#   log.showRoot=true        the root commit's additions are part of history
+#   color.ui=false           no ANSI escapes in the output we parse
+_GIT_CONFIG = (
+    "core.quotePath=false",
+    "core.fsmonitor=false",
+    "diff.noprefix=false",
+    "diff.mnemonicPrefix=false",
+    "diff.relative=false",
+    "diff.suppressBlankEmpty=false",
+    "diff.submodule=short",
+    "log.showSignature=false",
+    "log.showRoot=true",
+    "color.ui=false",
+)
+
+# Flags for every diff/log call: no external diff programs or textconv
+# filters (diff.external, diff.<driver>.command/textconv would replace the
+# text we scan with their own output), fixed prefixes, zero context.
+_DIFF_FLAGS = (
+    "--no-ext-diff",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--no-color",
+    "-U0",
+    "--inter-hunk-context=0",
+)
+
+# Environment variables that change diff output or start programs.
+_GIT_ENV_DROP = ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "PAGER")
+
+
+def _git_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
+    # Read-only tool: never take optional locks (git diff may otherwise
+    # rewrite the index to refresh stat data) and never prompt.
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
 
 
 def _run_git(repo_path: str, *args: str) -> subprocess.CompletedProcess:
@@ -685,9 +748,12 @@ def _run_git(repo_path: str, *args: str) -> subprocess.CompletedProcess:
         raise ValueError(
             f"Path not found: {repo_path} — pass an absolute path to a git repository."
         )
+    config_args: list[str] = []
+    for item in _GIT_CONFIG:
+        config_args += ["-c", item]
     try:
         return subprocess.run(
-            ["git", "-C", str(repo), *args],
+            ["git", *config_args, "-C", str(repo), *args],
             # Never inherit stdin: under an MCP stdio server it is the protocol
             # pipe. On Windows, duplicating that handle for the child blocks
             # while the server's reader thread is waiting on it (mcp 1.x hangs
@@ -697,11 +763,11 @@ def _run_git(repo_path: str, *args: str) -> subprocess.CompletedProcess:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=_git_env(),
         )
     except FileNotFoundError:
         raise ValueError(
-            "git executable not found on PATH — install Git to use "
-            "scan_git_staged / scan_git_history."
+            "git executable not found on PATH — install Git to use the git scans."
         ) from None
 
 
@@ -714,44 +780,132 @@ def _ensure_git_repo(repo_path: str) -> None:
         )
 
 
-def _scan_diff(diff_text: str) -> tuple[list[dict], set[str]]:
-    """Scan unified diff output (-U0), added lines only.
+_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+_OCTAL_ESCAPE_RE = re.compile(r"[0-3][0-7]{2}")
 
-    Tracks the current file from `+++ b/...` headers, the new-file line number
-    from `@@` hunk headers, and — for `git log` output — the current commit
-    from `commit <hash>` separator lines. Deletions never advance the line
-    counter (correct for zero-context diffs).
+
+def _unquote_git_path(name: str) -> str:
+    """Decode a path git printed in C-quoted form, such as "tab\\there.txt".
+
+    With core.quotePath=false git still quotes names that contain control
+    characters, double quotes or backslashes; octal escapes are raw bytes of
+    the UTF-8 name.
+    """
+    if len(name) < 2 or name[0] != '"' or name[-1] != '"':
+        return name
+    body = name[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        char = body[i]
+        if char == "\\" and i + 1 < len(body):
+            if _OCTAL_ESCAPE_RE.match(body, i + 1):
+                out.append(int(body[i + 1 : i + 4], 8))
+                i += 4
+                continue
+            if body[i + 1] in _C_ESCAPES:
+                out.append(_C_ESCAPES[body[i + 1]])
+                i += 2
+                continue
+        out += char.encode("utf-8", errors="replace")
+        i += 1
+    return out.decode("utf-8", errors="replace")
+
+
+def _diff_target(name: str) -> str | None:
+    """Repo-relative path from the target side of a diff header, or None."""
+    if name.endswith("\t"):  # git appends a tab when the name contains a space
+        name = name[:-1]
+    name = _unquote_git_path(name)
+    if name == "/dev/null":
+        return None
+    return name[2:] if name.startswith("b/") else name
+
+
+def _scan_diff(diff_text: str) -> tuple[list[dict], set[str], list[str]]:
+    """Scan unified diff output (git diff / git log -p, -U0), added lines only.
+
+    A small state machine instead of prefix matching, so that file content
+    can never be mistaken for a header:
+
+    * header state (after ``diff --git`` or ``commit <hash>``): ``+++ b/…``
+      names the file, ``Binary files … differ`` marks a skipped binary.
+    * hunk state (after ``@@ -a,b +c,d @@``): exactly ``b`` removed and ``d``
+      added lines follow, counted down from the hunk header. Every ``+`` line
+      in that window is content, even when it reads ``+++ something``.
+
+    Returns (findings, files with additions, binary files skipped).
     """
     findings: list[dict] = []
     files_seen: set[str] = set()
+    binaries: list[str] = []
     current_file: str | None = None
     current_commit: str | None = None
+    in_header = False
     new_line = 0
+    old_left = new_left = 0
 
-    for raw in diff_text.splitlines():
-        if raw.startswith("+++ "):
-            target = raw[4:].strip()
-            if target == "/dev/null":
-                current_file = None
-            else:
-                current_file = target[2:] if target.startswith(("a/", "b/")) else target
-                files_seen.add(current_file)
-        elif raw.startswith("+"):
-            if current_file is not None:
-                for hit in _scan_line(raw[1:]):
-                    findings.append(_finding(current_file, new_line, hit, commit=current_commit))
-            new_line += 1
-        elif raw.startswith("@@"):
-            match = _HUNK_RE.match(raw)
-            if match:
-                new_line = int(match.group(1))
+    for raw in _split_lines(diff_text):
+        if old_left > 0 or new_left > 0:  # inside a hunk
+            tag = raw[:1]
+            if tag == "+":
+                if current_file is not None:
+                    for hit in _scan_line(raw[1:]):
+                        findings.append(_finding(current_file, new_line, hit, commit=current_commit))
+                new_line += 1
+                new_left -= 1
+                continue
+            if tag == "-":
+                old_left -= 1
+                continue
+            if tag == " ":  # context line (none expected with -U0, handled anyway)
+                new_line += 1
+                new_left -= 1
+                old_left -= 1
+                continue
+            if tag == "\\":  # "\ No newline at end of file"
+                continue
+            old_left = new_left = 0  # malformed hunk: fall through to headers
+
+        if raw.startswith("diff --git "):
+            in_header = True
+            current_file = None
         elif raw.startswith("commit "):
             match = _COMMIT_RE.match(raw)
             if match:
                 current_commit = match.group(1)
                 current_file = None
-        # everything else (deletions, headers) is irrelevant with -U0
-    return findings, files_seen
+                in_header = True
+        elif raw.startswith("@@"):
+            match = _HUNK_RE.match(raw)
+            if match:
+                old_left = int(match.group(1)) if match.group(1) is not None else 1
+                new_line = int(match.group(2))
+                new_left = int(match.group(3)) if match.group(3) is not None else 1
+                in_header = False
+        elif in_header and raw.startswith("+++ "):
+            current_file = _diff_target(raw[4:])
+            if current_file is not None:
+                files_seen.add(current_file)
+        elif in_header and raw.startswith("Binary files "):
+            match = _BINARY_RE.match(raw)
+            if match:
+                target = _diff_target(match.group(2))
+                if target is not None and target not in binaries:
+                    binaries.append(target)
+        # everything else (index, mode, rename, --- lines) carries no content
+    return findings, files_seen, binaries
+
+
+def _binary_note(binaries: list[str]) -> str:
+    if not binaries:
+        return ""
+    shown = ", ".join(binaries[:5]) + (", …" if len(binaries) > 5 else "")
+    return f" [{len(binaries)} binary file(s) not scanned: {shown}]"
+
+
+def _has_commits(repo_path: str) -> bool:
+    return _run_git(repo_path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}").returncode == 0
 
 
 def scan_git_staged(repo_path: str) -> dict:
@@ -759,14 +913,16 @@ def scan_git_staged(repo_path: str) -> dict:
     content the next commit would publish.
 
     Findings carry the file path (repo-relative) and the post-commit line
-    number of each added line.
+    number of each added line. Local diff configuration (external diff tools,
+    textconv filters, prefix settings, path quoting) is overridden, so what
+    is scanned is always the staged text itself.
 
     Raises:
         ValueError: if the path is missing, not a git repository, or git is
         not installed.
     """
     _ensure_git_repo(repo_path)
-    proc = _run_git(repo_path, "diff", "--cached", "-U0", "--no-color")
+    proc = _run_git(repo_path, "diff", "--cached", *_DIFF_FLAGS)
     if proc.returncode != 0:
         raise ValueError(f"'git diff --cached' failed in {repo_path}: {proc.stderr.strip()}")
     if not proc.stdout.strip():
@@ -779,7 +935,7 @@ def scan_git_staged(repo_path: str) -> dict:
                 "again before committing."
             ),
         }
-    findings, files_seen = _scan_diff(proc.stdout)
+    findings, files_seen, binaries = _scan_diff(proc.stdout)
     result = _build_result(findings, len(files_seen))
     if findings:
         result["summary"] += " Unstage the affected files and strip the secrets before committing."
@@ -788,15 +944,20 @@ def scan_git_staged(repo_path: str) -> dict:
             f"Staged changes are clean — {len(files_seen)} file(s) with additions "
             "scanned, no secrets in the added lines."
         )
+    result["summary"] += _binary_note(binaries)
     return result
 
 
-def scan_git_history(repo_path: str, max_commits: int = 50) -> dict:
+def scan_git_history(repo_path: str, max_commits: int = 50, all_branches: bool = False) -> dict:
     """Scan the lines added by the last *max_commits* commits.
 
     Each finding is tagged with the (short) commit hash that introduced it.
     Note that removing a secret in a later commit does NOT make it safe:
     history retains it, so rotation is always required.
+
+    Args:
+        all_branches: walk every ref (all branches, tags and the stash)
+            instead of only the history of HEAD.
 
     Raises:
         ValueError: if the path is missing, not a git repository, git is not
@@ -805,32 +966,110 @@ def scan_git_history(repo_path: str, max_commits: int = 50) -> dict:
     _ensure_git_repo(repo_path)
     if max_commits < 1:
         raise ValueError("max_commits must be at least 1.")
-    proc = _run_git(
-        repo_path,
-        "log",
-        "-p",
-        "-U0",
-        "--no-color",
-        f"-n{max_commits}",
-        "--pretty=format:commit %h",
-    )
+    if not all_branches and not _has_commits(repo_path):
+        return {
+            "clean": True,
+            "findings": [],
+            "files_scanned": 0,
+            "summary": "Repository has no commits yet — history is empty.",
+        }
+    args = ["log", "-p", *_DIFF_FLAGS, f"-n{max_commits}", "--format=commit %h"]
+    if all_branches:
+        args.append("--all")
+    proc = _run_git(repo_path, *args)
     if proc.returncode != 0:
-        stderr = proc.stderr.strip()
-        if "does not have any commits" in stderr or "bad default revision" in stderr:
-            return {
-                "clean": True,
-                "findings": [],
-                "files_scanned": 0,
-                "summary": "Repository has no commits yet — history is empty.",
-            }
-        raise ValueError(f"'git log' failed in {repo_path}: {stderr}")
-    findings, files_seen = _scan_diff(proc.stdout)
+        raise ValueError(f"'git log' failed in {repo_path}: {proc.stderr.strip()}")
+    findings, files_seen, binaries = _scan_diff(proc.stdout)
     result = _build_result(findings, len(files_seen))
     if findings:
         result["summary"] += (
             " These additions live in commit history: removing the file now is "
             "NOT enough — rotate the affected credentials."
         )
+    result["summary"] += _binary_note(binaries)
+    return result
+
+
+_UPSTREAM_HINT = (
+    "The current branch has no upstream (it was never pushed with -u, or HEAD "
+    "is detached). Pass the branch you are going to push to as base, for "
+    "example base='origin/main'."
+)
+
+
+def _resolve_commit(repo_path: str, rev: str, role: str) -> str:
+    """Resolve *rev* to a full commit hash, rejecting option-like input."""
+    if not rev or rev.startswith("-") or any(c in rev for c in "\0\n\r"):
+        raise ValueError(f"Invalid {role} revision {rev!r}: pass a branch, tag or commit.")
+    proc = _run_git(repo_path, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
+    if proc.returncode != 0:
+        if re.search(r"@\{(?:u|upstream|push)\}", rev, re.IGNORECASE):
+            raise ValueError(_UPSTREAM_HINT)
+        raise ValueError(f"Unknown {role} revision {rev!r} in {repo_path}.")
+    return proc.stdout.strip()
+
+
+def scan_git_range(
+    repo_path: str,
+    base: str = "@{upstream}",
+    head: str = "HEAD",
+    max_commits: int = 200,
+) -> dict:
+    """Scan the commits in ``base..head`` — by default, what `git push`
+    would publish: every commit on the current branch that its upstream
+    does not have yet.
+
+    Each finding is tagged with the commit that introduced it. The result
+    adds ``commits_scanned`` and ``range`` to the standard report.
+
+    Raises:
+        ValueError: if the path is not a git repository, a revision does not
+        exist (with a hint when there is no upstream), or max_commits < 1.
+    """
+    _ensure_git_repo(repo_path)
+    if max_commits < 1:
+        raise ValueError("max_commits must be at least 1.")
+    base_sha = _resolve_commit(repo_path, base, "base")
+    head_sha = _resolve_commit(repo_path, head, "head")
+    span = f"{base_sha}..{head_sha}"
+    label = f"{base}..{head}"
+
+    count_proc = _run_git(repo_path, "rev-list", "--count", span)
+    if count_proc.returncode != 0:
+        raise ValueError(f"'git rev-list' failed in {repo_path}: {count_proc.stderr.strip()}")
+    total = int(count_proc.stdout.strip() or 0)
+    if total == 0:
+        return {
+            "clean": True,
+            "findings": [],
+            "files_scanned": 0,
+            "summary": f"Nothing to scan: {head} has no commits that {base} does not already have.",
+            "commits_scanned": 0,
+            "range": label,
+        }
+
+    proc = _run_git(
+        repo_path, "log", "-p", *_DIFF_FLAGS, f"-n{max_commits}", "--format=commit %h", span
+    )
+    if proc.returncode != 0:
+        raise ValueError(f"'git log' failed in {repo_path}: {proc.stderr.strip()}")
+    findings, files_seen, binaries = _scan_diff(proc.stdout)
+    scanned = min(total, max_commits)
+    result = _build_result(findings, len(files_seen))
+    result["summary"] = f"{scanned} commit(s) in {label}: " + result["summary"]
+    if findings:
+        result["summary"] += (
+            " Rewrite or drop these commits before pushing, and rotate the "
+            "affected credentials."
+        )
+    if total > scanned:
+        result["summary"] += (
+            f" [only the newest {scanned} of {total} commits were scanned — "
+            "raise max_commits for the rest]"
+        )
+    result["summary"] += _binary_note(binaries)
+    result["commits_scanned"] = scanned
+    result["range"] = label
     return result
 
 

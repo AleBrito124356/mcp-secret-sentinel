@@ -12,9 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The git tools hung forever under mcp 1.x on Windows.** git inherited the server's stdin, which is the MCP protocol pipe; duplicating that handle blocks while the SDK's reader thread waits on it. git now always runs with stdin closed.
 - Tool errors (missing path, not a git repository) reach the agent with their message. mcp 2.x replaces the text of unexpected exceptions with a bare "Error executing tool", so core `ValueError`s are re-raised as `ToolError`.
 - The README promised `uvx mcp-secret-sentinel`, `pip install mcp-secret-sentinel` and PyPI badges for a package that was never published. The install instructions now use the git URL, which works today.
+- **`scan_git_staged` reported "no staged changes" for a staged secret when `diff.external` was configured (difftastic and similar), and git ran that external program.** Every git call now passes `--no-ext-diff --no-textconv` and fixed `a/`/`b/` prefixes, and forces `core.quotePath`, `core.fsmonitor`, `diff.noprefix`, `diff.mnemonicPrefix`, `diff.relative`, `diff.submodule`, `log.showSignature` and `log.showRoot` with `-c`. It also drops `GIT_EXTERNAL_DIFF`/`GIT_DIFF_OPTS` and takes no optional locks.
+- File paths in git findings were wrong under `diff.mnemonicPrefix` (`i/notify.py`), under `diff.noprefix` (a real `b/` directory was dropped) and for non-ASCII names (`"b/configuraci\303\263n.py"`). C-quoted names are now decoded.
+- An added line that started with `++ ` was taken as a new file header, and every finding after it got the wrong file and line. The diff parser is now a state machine that counts hunk lines.
+- `diff.interHunkContext` merged hunks with context lines, and those lines shifted the reported line numbers. With `log.showRoot=false` the root commit was never scanned.
 
 ### Added
 
+- `scan_git_range(repo_path, base="@{upstream}", head="HEAD", max_commits=200)` scans exactly what the next `git push` would publish, tags each finding with its commit, and adds `commits_scanned`/`range` to the report. When the branch has no upstream, the error says which `base` to pass. Revisions that start with `-` are rejected, so the argument can never become a git option.
+- `scan_git_history(..., all_branches=True)` walks every branch, tag and the stash.
+- Binary files in a staged diff or in history are named in the summary instead of being skipped silently.
 - Read-only tool annotations (`readOnlyHint`, `idempotentHint`, `destructiveHint=false`, `openWorldHint=false`) on every tool, and server instructions that tell the agent when to call which tool.
 - `tests/test_server.py`: spawns the real server over stdio and drives every tool with the SDK's `ClientSession`, including error results and a check that no raw secret crosses the wire.
 

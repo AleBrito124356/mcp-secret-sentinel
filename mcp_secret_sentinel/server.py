@@ -33,8 +33,8 @@ from . import __version__, core
 INSTRUCTIONS = (
     "Secret Sentinel scans code for exposed credentials and never returns a "
     "secret in full: every finding is redacted. Run scan_git_staged before "
-    "every commit, and scan any snippet with scan_text before writing it to "
-    "a file. When a finding is reported, remove the literal and load it from "
+    "every commit and scan_git_range before every push, and scan any snippet "
+    "with scan_text before writing it to a file. When a finding is reported, remove the literal and load it from "
     "the environment instead, and tell the user to rotate the credential if "
     "it was ever committed or shared."
 )
@@ -136,7 +136,9 @@ def scan_git_staged(repo_path: str) -> dict:
 
     This is the pre-commit checkpoint: it inspects exactly the content the
     next commit would publish, and reports the file and post-commit line
-    number of every added secret.
+    number of every added secret. Local diff settings (external diff tools,
+    textconv filters, prefixes, path quoting) are overridden, and git runs
+    no configured programs.
 
     Args:
         repo_path: Absolute path to a git repository (or any path inside one).
@@ -149,7 +151,7 @@ def scan_git_staged(repo_path: str) -> dict:
 
 
 @mcp.tool(annotations=_READ_ONLY)
-def scan_git_history(repo_path: str, max_commits: int = 50) -> dict:
+def scan_git_history(repo_path: str, max_commits: int = 50, all_branches: bool = False) -> dict:
     """Scan the lines added by the most recent commits (git log -p).
 
     Each finding is tagged with the short hash of the commit that introduced
@@ -159,12 +161,41 @@ def scan_git_history(repo_path: str, max_commits: int = 50) -> dict:
     Args:
         repo_path: Absolute path to a git repository (or any path inside one).
         max_commits: How many commits back to inspect (default 50).
+        all_branches: Walk every branch, tag and the stash instead of only
+            the history of HEAD (default false).
 
     Returns:
         The standard redacted findings report, with a "commit" field on each
         finding.
     """
-    return _call(core.scan_git_history, repo_path, max_commits)
+    return _call(core.scan_git_history, repo_path, max_commits, all_branches)
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def scan_git_range(
+    repo_path: str,
+    base: str = "@{upstream}",
+    head: str = "HEAD",
+    max_commits: int = 200,
+) -> dict:
+    """Scan the commits in base..head: by default, what `git push` would send.
+
+    Run this before pushing. With the defaults it scans every commit on the
+    current branch that its upstream does not have yet. If the branch has no
+    upstream, the error says so: pass the branch you will push to as base
+    (for example "origin/main").
+
+    Args:
+        repo_path: Absolute path to a git repository (or any path inside one).
+        base: Commits reachable from here are excluded (default "@{upstream}").
+        head: Last commit to include (default "HEAD").
+        max_commits: Scan at most this many of the newest commits in the range.
+
+    Returns:
+        The standard redacted findings report with a "commit" field on each
+        finding, plus "commits_scanned" and "range".
+    """
+    return _call(core.scan_git_range, repo_path, base, head, max_commits)
 
 
 @mcp.tool(annotations=_READ_ONLY)

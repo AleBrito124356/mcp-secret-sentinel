@@ -41,6 +41,7 @@ EXPECTED_TOOLS = {
     "scan_directory",
     "scan_git_staged",
     "scan_git_history",
+    "scan_git_range",
     "list_patterns",
 }
 RAW_SECRETS = [GENERIC_VALUE, SLACK_HOOK_SECRET, STRIPE_SECRET, TWILIO_KEY]
@@ -81,6 +82,14 @@ def session(tmp_path_factory):
     git(history, "add", "config.ini")
     git(history, "commit", "-q", "-m", "add config")
 
+    ranged = init_repo(work / "range-repo")
+    (ranged / "a.txt").write_text("hello\n", encoding="utf-8")
+    git(ranged, "add", "a.txt")
+    git(ranged, "commit", "-q", "-m", "base")
+    (ranged / "notify.py").write_text(SLACK_HOOK_LINE + "\n", encoding="utf-8")
+    git(ranged, "add", "notify.py")
+    git(ranged, "commit", "-q", "-m", "unpushed")
+
     plain = work / "plain"
     plain.mkdir()
 
@@ -90,6 +99,8 @@ def session(tmp_path_factory):
         "scan_directory": ("scan_directory", {"path": str(tree)}),
         "scan_git_staged": ("scan_git_staged", {"repo_path": str(staged)}),
         "scan_git_history": ("scan_git_history", {"repo_path": str(history), "max_commits": 5}),
+        "scan_git_range": ("scan_git_range", {"repo_path": str(ranged), "base": "HEAD~1"}),
+        "range_no_upstream": ("scan_git_range", {"repo_path": str(ranged)}),
         "list_patterns": ("list_patterns", {}),
         "missing_file": ("scan_file", {"path": str(work / "missing.txt")}),
         "not_a_repo": ("scan_git_staged", {"repo_path": str(plain)}),
@@ -173,6 +184,16 @@ def test_scan_git_history_over_stdio(session):
     (finding,) = payload["findings"]
     assert (finding["file"], finding["line"]) == ("config.ini", 2)
     assert finding["commit"]
+
+
+def test_scan_git_range_over_stdio(session):
+    payload = _payload(session["results"]["scan_git_range"])
+    (finding,) = payload["findings"]
+    assert (finding["file"], finding["line"]) == ("notify.py", 1)
+    assert payload["commits_scanned"] == 1
+    no_upstream = session["results"]["range_no_upstream"]
+    assert _attr(no_upstream, "isError", "is_error") is True
+    assert "origin/main" in _text(no_upstream)
 
 
 def test_list_patterns_over_stdio(session):

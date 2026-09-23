@@ -9,7 +9,7 @@
 
 **MCP server that scans code for exposed secrets — API keys, tokens, private keys and high-entropy strings — with placeholder-aware allowlisting and redacted reports.**
 
-Secrets rarely leak through hackers; they leak through commits. An agent (or a human in a hurry) pastes a webhook URL into a config, stages it, pushes — and from that moment the credential is compromised, even if the next commit deletes it, because history keeps every added line. mcp-secret-sentinel gives an agent a pre-commit checkpoint: scan a snippet, a file, a whole tree, the staged diff, or recent history, and get back a severity-ranked, fully redacted report it can act on *before* anything leaves the machine. The full secret value never appears in the tool output, so it never enters the conversation transcript either.
+Secrets rarely leak through hackers; they leak through commits. An agent (or a human in a hurry) pastes a webhook URL into a config, stages it, pushes — and from that moment the credential is compromised, even if the next commit deletes it, because history keeps every added line. mcp-secret-sentinel gives an agent a pre-commit checkpoint: scan a snippet, a file, a whole tree, the staged diff, the commits you are about to push, or recent history, and get back a severity-ranked, fully redacted report it can act on *before* anything leaves the machine. The full secret value never appears in the tool output, so it never enters the conversation transcript either.
 
 ## Tools
 
@@ -19,8 +19,11 @@ Secrets rarely leak through hackers; they leak through commits. An agent (or a h
 | `scan_file` | `path` | Findings for one file; skips binaries (null-byte heuristic) and files over 5 MB |
 | `scan_directory` | `path`, `max_files=500` | Recursive scan; skips `.git`, `node_modules`, virtualenvs, `__pycache__`, `dist`, `build`, minified JS, lockfiles, and honors simple `.gitignore` patterns |
 | `scan_git_staged` | `repo_path` | Scans only the lines added in `git diff --cached` — the exact content the next commit would publish |
-| `scan_git_history` | `repo_path`, `max_commits=50` | Scans lines added by the last N commits, tagging each finding with its commit hash |
+| `scan_git_range` | `repo_path`, `base="@{upstream}"`, `head="HEAD"`, `max_commits=200` | Scans the commits in `base..head` — by default exactly what the next `git push` would publish. Adds `commits_scanned` and `range` to the report |
+| `scan_git_history` | `repo_path`, `max_commits=50`, `all_branches=false` | Scans lines added by the last N commits (of HEAD, or of every branch, tag and the stash), tagging each finding with its commit hash |
 | `list_patterns` | — | Active detectors with severity and remediation advice, plus the allowlist rules |
+
+Every tool is annotated read-only (`readOnlyHint`, no open-world access), so MCP clients can run it without a confirmation prompt.
 
 All scan tools return the same shape:
 
@@ -65,6 +68,17 @@ Each candidate value is checked against these placeholder heuristics before bein
 
 Every finding shows only the first 4 characters plus the total length — e.g. `"hook…(77 chars)"`. The full value never appears in the output, the transcript, or the logs. This is enforced in code (a single `redact()` choke point) and in the test suite, which asserts the raw values are absent from serialized results.
 
+### Git scans read the text, not your diff settings
+
+The git tools parse `git diff` / `git log -p` output, and local git settings used to be able to change that output: an external diff tool (`diff.external`, difftastic and friends) replaced the diff entirely, so staged secrets were reported as *"no staged changes"* while the external program ran, and `diff.mnemonicPrefix`, `diff.noprefix` or quoted non-ASCII paths corrupted the reported file names. Every git call now:
+
+- passes `--no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ -U0 --inter-hunk-context=0 --no-color`;
+- overrides `core.quotePath`, `core.fsmonitor`, `diff.noprefix`, `diff.mnemonicPrefix`, `diff.relative`, `diff.submodule`, `log.showSignature` and `log.showRoot` with `-c`;
+- drops `GIT_EXTERNAL_DIFF` / `GIT_DIFF_OPTS` from the environment, sets `GIT_OPTIONAL_LOCKS=0`, and closes stdin;
+- rejects revisions that start with `-`, so an agent-supplied `base` can never become a git option.
+
+The diff parser is a state machine driven by the hunk line counts, so an added line that reads `+++ something` is content, never a file header. Binary files are named in the summary instead of being skipped silently.
+
 ## How it works
 
 ```mermaid
@@ -72,7 +86,7 @@ flowchart TD
     A[Agent calls a scan tool] --> B{Source}
     B -->|scan_text / scan_file| C[Split into lines]
     B -->|scan_directory| D[Walk tree, skip .git, node_modules,<br/>binaries, lockfiles, .gitignore matches] --> C
-    B -->|scan_git_staged / scan_git_history| E[git diff / git log with zero context,<br/>keep added lines only] --> C
+    B -->|scan_git_staged / scan_git_range /<br/>scan_git_history| E[git diff / git log -p, zero context,<br/>diff config overridden, no external programs] --> P[Hunk-counting parser:<br/>added lines, real paths, commit tags] --> C
     C --> F[19 regex detectors,<br/>specific patterns claim spans first]
     C --> G[Shannon entropy >= 4.5 bits/char<br/>on assigned strings of 20+ chars]
     F --> H{Allowlist check:<br/>placeholders, masked values,<br/>example domains, env lookups}
@@ -150,9 +164,9 @@ Then use `mcp-secret-sentinel` as the command in any MCP client config.
 >
 > **User:** Done — check again.
 >
-> **Claude** calls `scan_git_staged(...)` → `"clean": true, "summary": "Staged changes are clean — 6 file(s) with additions scanned, no secrets in the added lines."` — then `scan_git_history(repo_path="C:/dev/acme-app", max_commits=20)` → `"clean": true`.
+> **Claude** calls `scan_git_staged(...)` → `"clean": true, "summary": "Staged changes are clean — 6 file(s) with additions scanned, no secrets in the added lines."` — commits, then calls `scan_git_range(repo_path="C:/dev/acme-app")` → `"clean": true, "commits_scanned": 3, "range": "@{upstream}..HEAD"`.
 >
-> **Claude:** Clean — the staged changes and the last 20 commits contain no detectable secrets. Safe to push.
+> **Claude:** Clean — the staged changes and the 3 commits your push would publish contain no detectable secrets. Safe to push.
 
 ## Limitations
 
