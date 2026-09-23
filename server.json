@@ -3,7 +3,7 @@
   "name": "io.github.AleBrito124356/mcp-secret-sentinel",
   "title": "Secret Sentinel",
   "description": "Scan code, files, staged diffs and git history for exposed secrets — findings always redacted",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "repository": {
     "url": "https://github.com/AleBrito124356/mcp-secret-sentinel",
     "source": "github"
@@ -13,7 +13,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "mcp-secret-sentinel",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "runtimeHint": "uvx",
       "transport": {"type": "stdio"}
     }

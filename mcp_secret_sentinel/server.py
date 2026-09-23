@@ -1,99 +1,188 @@
-"""mcp-secret-sentinel — FastMCP entry point.
+"""mcp-secret-sentinel — MCP entry point.
 
 Wiring only: every tool delegates to core.py, which is pure stdlib and
 unit-tested without the mcp package installed.
 
+Works with both majors of the official Python SDK:
+
+* mcp 2.x — ``mcp.server.mcpserver.MCPServer`` (FastMCP was renamed)
+* mcp 1.x — ``mcp.server.fastmcp.FastMCP``
+
 Run over stdio:  mcp-secret-sentinel  (or python -m mcp_secret_sentinel.server)
 """
 
-from mcp.server.fastmcp import FastMCP
+# No "from __future__ import annotations" here: mcp 1.x before 1.9 inspects
+# tool annotations with issubclass() and breaks on string annotations.
+from typing import Any, Callable
 
-from . import core
+try:  # mcp >= 2.0
+    from mcp.server.mcpserver import MCPServer as _ServerClass
+    from mcp.server.mcpserver.exceptions import ToolError
 
-mcp = FastMCP("mcp-secret-sentinel")
+    SDK_MAJOR = 2
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP as _ServerClass
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    SDK_MAJOR = 1
+
+from mcp.types import ToolAnnotations
+
+from . import __version__, core
+
+INSTRUCTIONS = (
+    "Secret Sentinel scans code for exposed credentials and never returns a "
+    "secret in full: every finding is redacted. Run scan_git_staged before "
+    "every commit and scan_git_range before every push, and scan any snippet "
+    "with scan_text before writing it to a file. When a finding is reported, remove the literal and load it from "
+    "the environment instead, and tell the user to rotate the credential if "
+    "it was ever committed or shared."
+)
+
+# mcp 2.x reports our version in serverInfo; 1.x has no such argument and
+# reports the SDK version instead.
+_VERSION_KWARGS = {"version": __version__} if SDK_MAJOR >= 2 else {}
+
+mcp = _ServerClass("mcp-secret-sentinel", instructions=INSTRUCTIONS, **_VERSION_KWARGS)
+
+# Every tool only reads files or git objects: nothing is written, nothing
+# leaves the machine. Clients use these hints to skip confirmation prompts.
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 
-@mcp.tool()
-def scan_text(text: str, source_name: str = "input") -> dict:
+def _call(fn: Callable[..., dict], *args: Any) -> dict:
+    """Run a core function, turning its ValueErrors into MCP tool errors.
+
+    core.py raises ValueError with an actionable message (missing path, not
+    a git repository...). mcp 2.x hides the text of unexpected exceptions
+    from the client, so it must be re-raised as a ToolError to reach the
+    agent as an ``isError`` result it can act on.
+    """
+    try:
+        return fn(*args)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from None
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def scan_text(
+    text: str, source_name: str = "input", max_findings: int = core.DEFAULT_MAX_FINDINGS
+) -> dict:
     """Scan a snippet of text or code for exposed secrets.
 
-    Detects API keys (GitHub, OpenAI, Anthropic, NVIDIA, AWS, Stripe, Google,
-    Twilio), Slack/Discord tokens and webhooks, JWTs, private key blocks,
-    credentialed connection strings, generic password/secret/token
-    assignments, and high-entropy strings — while skipping obvious
-    placeholders (allowlist).
+    33 detectors: GitHub/GitLab/npm/PyPI tokens, OpenAI (incl. sk-proj-),
+    Anthropic, OpenRouter, Groq, NVIDIA and Hugging Face keys, AWS, Azure,
+    Google, DigitalOcean, Stripe, Shopify, SendGrid, Twilio, Slack, Discord
+    and Telegram credentials, JWTs, private and age keys, credentialed
+    connection strings and URLs, generic password/secret/token assignments,
+    plus high-entropy strings. Placeholders ($VAR, ${VAR}, {{ templates }},
+    %(name)s, changeme, masked values...) are skipped, and a line carrying
+    "secret-sentinel: ignore" or "pragma: allowlist secret" is counted in
+    "suppressed" instead of reported.
 
     Args:
         text: The raw text to scan (code, config, diff output, logs...).
         source_name: Label used in each finding's "file" field.
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
 
     Returns:
         {"clean": bool,
          "findings": [{"file", "line", "pattern", "severity", "redacted", "advice"}],
          "files_scanned": int, "summary": str}
-        Secret values are ALWAYS redacted (first 4 chars + length); the full
-        value is never included in the output.
+        Secret values are ALWAYS redacted (at most 4 chars, never more than a
+        quarter of the value, + length); the full value is never included.
     """
-    return core.scan_text(text, source_name)
+    return _call(core.scan_text, text, source_name, max_findings)
 
 
-@mcp.tool()
-def scan_file(path: str) -> dict:
+@mcp.tool(annotations=_READ_ONLY)
+def scan_file(path: str, max_findings: int = core.DEFAULT_MAX_FINDINGS) -> dict:
     """Scan a single file for exposed secrets.
 
-    Binary files (null-byte heuristic) and files larger than 5 MB are skipped
-    and reported as such in the summary.
+    UTF-8, UTF-16 and UTF-32 text is decoded by byte-order mark. Binary files
+    (null-byte heuristic) and files larger than 5 MB are skipped and reported
+    as such in the summary.
 
     Args:
         path: Absolute path to the file to scan.
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
 
     Returns:
-        The standard redacted findings report (see scan_text). Raises an error
-        if the file does not exist.
+        The standard redacted findings report (see scan_text). Returns an
+        error result if the file does not exist.
     """
-    return core.scan_file(path)
+    return _call(core.scan_file, path, max_findings)
 
 
-@mcp.tool()
-def scan_directory(path: str, max_files: int = 500) -> dict:
+@mcp.tool(annotations=_READ_ONLY)
+def scan_directory(
+    path: str, max_files: int = 500, max_findings: int = core.DEFAULT_MAX_FINDINGS
+) -> dict:
     """Recursively scan a directory tree for exposed secrets.
 
-    Automatically skips .git, node_modules, .venv/venv, __pycache__, dist,
-    build, minified JS bundles, lockfiles, binaries, files over 5 MB, and
-    simple patterns from the root .gitignore (best-effort: no negations, no
-    ** globs).
+    Automatically skips .git, node_modules, virtualenvs and conda envs under
+    any name, site-packages, tool caches (.tox, .nox, .mypy_cache,
+    .pytest_cache, .ruff_cache), __pycache__, dist, build, minified JS
+    bundles, lockfiles, binaries, files over 5 MB, and simple patterns from
+    the root .gitignore (best-effort: no negations, no ** globs).
 
     Args:
         path: Absolute path to the directory to scan.
         max_files: Stop after scanning this many files (default 500).
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
 
     Returns:
         The standard redacted findings report; finding paths are relative to
         the scanned root, using forward slashes.
     """
-    return core.scan_directory(path, max_files)
+    return _call(core.scan_directory, path, max_files, max_findings)
 
 
-@mcp.tool()
-def scan_git_staged(repo_path: str) -> dict:
+@mcp.tool(annotations=_READ_ONLY)
+def scan_git_staged(repo_path: str, max_findings: int = core.DEFAULT_MAX_FINDINGS) -> dict:
     """Scan ONLY the lines currently staged for commit (git diff --cached).
 
     This is the pre-commit checkpoint: it inspects exactly the content the
     next commit would publish, and reports the file and post-commit line
-    number of every added secret.
+    number of every added secret. Local diff settings (external diff tools,
+    textconv filters, prefixes, path quoting) are overridden, and git runs
+    no configured programs.
 
     Args:
         repo_path: Absolute path to a git repository (or any path inside one).
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
 
     Returns:
         The standard redacted findings report. If nothing is staged the result
         is clean with an explanatory summary.
     """
-    return core.scan_git_staged(repo_path)
+    return _call(core.scan_git_staged, repo_path, max_findings)
 
 
-@mcp.tool()
-def scan_git_history(repo_path: str, max_commits: int = 50) -> dict:
+@mcp.tool(annotations=_READ_ONLY)
+def scan_git_history(
+    repo_path: str,
+    max_commits: int = 50,
+    all_branches: bool = False,
+    max_findings: int = core.DEFAULT_MAX_FINDINGS,
+) -> dict:
     """Scan the lines added by the most recent commits (git log -p).
 
     Each finding is tagged with the short hash of the commit that introduced
@@ -103,15 +192,53 @@ def scan_git_history(repo_path: str, max_commits: int = 50) -> dict:
     Args:
         repo_path: Absolute path to a git repository (or any path inside one).
         max_commits: How many commits back to inspect (default 50).
+        all_branches: Walk every branch, tag and the stash instead of only
+            the history of HEAD (default false).
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
 
     Returns:
         The standard redacted findings report, with a "commit" field on each
         finding.
     """
-    return core.scan_git_history(repo_path, max_commits)
+    return _call(core.scan_git_history, repo_path, max_commits, all_branches, max_findings)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
+def scan_git_range(
+    repo_path: str,
+    base: str = "@{upstream}",
+    head: str = "HEAD",
+    max_commits: int = 200,
+    max_findings: int = core.DEFAULT_MAX_FINDINGS,
+) -> dict:
+    """Scan the commits in base..head: by default, what `git push` would send.
+
+    Run this before pushing. With the defaults it scans every commit on the
+    current branch that its upstream does not have yet. If the branch has no
+    upstream, the error says so: pass the branch you will push to as base
+    (for example "origin/main").
+
+    Args:
+        repo_path: Absolute path to a git repository (or any path inside one).
+        base: Commits reachable from here are excluded (default "@{upstream}").
+        head: Last commit to include (default "HEAD").
+        max_commits: Scan at most this many of the newest commits in the range.
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
+
+    Returns:
+        The standard redacted findings report with a "commit" field on each
+        finding, plus "commits_scanned" and "range".
+    """
+    return _call(core.scan_git_range, repo_path, base, head, max_commits, max_findings)
+
+
+@mcp.tool(annotations=_READ_ONLY)
 def list_patterns() -> dict:
     """List the active secret detectors and allowlist rules.
 
@@ -126,7 +253,7 @@ def list_patterns() -> dict:
 
 
 def main() -> None:
-    """Entry point for the console script."""
+    """Serve the tools over stdio."""
     mcp.run()
 
 

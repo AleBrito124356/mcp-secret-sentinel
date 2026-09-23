@@ -1,7 +1,7 @@
 """Core scanning logic for mcp-secret-sentinel.
 
 Pure Python stdlib — no third-party imports. All MCP wiring lives in
-server.py; everything testable lives here.
+server.py and the command line in cli.py; everything testable lives here.
 
 Detection layers, in order:
 
@@ -13,9 +13,12 @@ Detection layers, in order:
    already claimed the same span.
 
 Every candidate value passes through a documented allowlist of placeholder
-heuristics before being reported, and every reported finding is redacted:
-the first 4 characters plus the total length. The full secret value never
-appears in any output produced by this module.
+heuristics before being reported. A line that carries an inline
+``secret-sentinel: ignore`` (or detect-secrets' ``pragma: allowlist secret``)
+comment is counted as suppressed instead of reported. Every reported finding
+is redacted: at most the first 4 characters (a quarter of the value for
+short secrets) plus the total length. The full secret value never appears in
+any output produced by this module.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ BINARY_SNIFF_BYTES = 8192          # null-byte heuristic window
 ENTROPY_THRESHOLD = 4.5            # bits per character
 ENTROPY_MIN_LENGTH = 20            # minimum candidate length
 ALLOWLIST_MIN_LENGTH = 8           # values shorter than this are never reported
+DEFAULT_MAX_FINDINGS = 200         # findings listed per report (0 = no limit)
 
 ENTROPY_PATTERN_NAME = "High-entropy string"
 
@@ -45,6 +49,7 @@ _SEV_CRITICAL = "critical"
 _SEV_HIGH = "high"
 _SEV_MEDIUM = "medium"
 _SEV_ORDER = {_SEV_CRITICAL: 0, _SEV_HIGH: 1, _SEV_MEDIUM: 2}
+SEVERITIES = (_SEV_CRITICAL, _SEV_HIGH, _SEV_MEDIUM)
 
 _ENTROPY_ADVICE = (
     "This looks like a random credential. If it is one, rotate it and load it "
@@ -52,24 +57,51 @@ _ENTROPY_ADVICE = (
     "variable or replacing the value with an obvious placeholder."
 )
 
+# Inline suppression markers, matched anywhere on the line (usually in a
+# trailing comment). The second one is detect-secrets' marker, so files
+# already annotated for that tool need no changes.
+SUPPRESSION_MARKERS = ("secret-sentinel: ignore", "pragma: allowlist secret")
+_SUPPRESS_RE = re.compile(r"(?i)secret-sentinel:\s*ignore|pragma:\s*allowlist\s+secret")
+
+# Tokens made of [A-Za-z0-9_-] can end in "-" or "_", where \b does not fire
+# before a quote or a space. This lookahead is the boundary they need.
+_TOKEN_END = r"(?![A-Za-z0-9_-])"
+
+# Documentation hosts reserved by RFC 2606 / RFC 6761. A password in a URL
+# pointing at one of these is a documentation example, not a leak.
+_RESERVED_HOST_RE = re.compile(
+    r"(?i)^(?:[a-z0-9-]+\.)*(?:example\.(?:com|net|org)|[a-z0-9-]+\.(?:example|invalid))\.?$"
+)
+
+
+def _reserved_example_host(match: re.Match) -> str | None:
+    """Context rule for credentialed URLs: skip documentation hosts only."""
+    return "example-host" if _RESERVED_HOST_RE.match(match.group("host")) else None
+
+
 # ---------------------------------------------------------------------------
 # Specific detectors
 #
 # Each entry: name, compiled regex, severity, advice. Optional "group" points
-# at the capture group holding the secret value (default: whole match).
-# Ordered specific-first: later, broader patterns are skipped when an earlier
-# match already claimed the same span on the line.
+# at the capture group holding the secret value (default: whole match). The
+# allowlist and the redaction both apply to that value only. "assignment"
+# marks the generic keyword detectors, which also get the code-expression
+# allowlist rule. Optional "skip" is a context rule that receives the match
+# and returns a rule name to drop it. Ordered specific-first: later, broader
+# patterns are skipped when an earlier match already claimed the same span.
 # ---------------------------------------------------------------------------
 
 PATTERNS: list[dict] = [
     {
         "name": "GitHub token",
-        "regex": re.compile(r"\b(?:ghp|gho|ghs)_[A-Za-z0-9]{20,255}\b"),
+        # ghp_ personal, gho_ OAuth, ghu_ user-to-server, ghs_ server-to-server,
+        # ghr_ refresh token.
+        "regex": re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,255}\b"),
         "severity": _SEV_CRITICAL,
         "advice": (
-            "Revoke the token in GitHub -> Settings -> Developer settings -> "
-            "Personal access tokens, then load it from an environment variable "
-            "or a secrets manager."
+            "Revoke the token in GitHub (Settings -> Developer settings, or the "
+            "OAuth/GitHub App that issued it), then load it from an environment "
+            "variable or a secrets manager."
         ),
     },
     {
@@ -82,6 +114,17 @@ PATTERNS: list[dict] = [
         ),
     },
     {
+        "name": "GitLab token",
+        # personal access, pipeline trigger, deploy and runner tokens
+        "regex": re.compile(r"\b(?:glpat|glptt|gldt|glrt)-[A-Za-z0-9_-]{20,255}" + _TOKEN_END),
+        "severity": _SEV_CRITICAL,
+        "advice": (
+            "Revoke the token in GitLab (User settings -> Access tokens, or the "
+            "project's CI/CD / repository settings) and store the replacement "
+            "as a masked CI variable or environment variable."
+        ),
+    },
+    {
         "name": "Anthropic API key",
         "regex": re.compile(r"\bsk-ant-[A-Za-z0-9_-]{16,255}"),
         "severity": _SEV_HIGH,
@@ -91,12 +134,35 @@ PATTERNS: list[dict] = [
         ),
     },
     {
+        "name": "OpenRouter API key",
+        "regex": re.compile(r"\bsk-or-v1-[a-f0-9]{64}\b"),
+        "severity": _SEV_HIGH,
+        "advice": (
+            "Delete the key at openrouter.ai/keys and read the replacement from "
+            "an environment variable such as OPENROUTER_API_KEY."
+        ),
+    },
+    {
         "name": "OpenAI API key",
-        "regex": re.compile(r"\bsk-(?!ant-)[A-Za-z0-9]{20,255}\b"),
+        # Project (sk-proj-), service-account (sk-svcacct-) and admin
+        # (sk-admin-) keys contain "-" and "_"; legacy user keys do not.
+        "regex": re.compile(
+            r"\bsk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,255}" + _TOKEN_END
+            + r"|(?!ant-)[A-Za-z0-9]{20,255}\b)"
+        ),
         "severity": _SEV_HIGH,
         "advice": (
             "Rotate the key in the OpenAI dashboard and read it from the "
             "OPENAI_API_KEY environment variable instead of hardcoding it."
+        ),
+    },
+    {
+        "name": "Groq API key",
+        "regex": re.compile(r"\bgsk_[A-Za-z0-9]{40,255}\b"),
+        "severity": _SEV_HIGH,
+        "advice": (
+            "Delete the key in the Groq console and read the replacement from "
+            "the GROQ_API_KEY environment variable."
         ),
     },
     {
@@ -109,8 +175,18 @@ PATTERNS: list[dict] = [
         ),
     },
     {
+        "name": "Hugging Face token",
+        "regex": re.compile(r"\bhf_[A-Za-z0-9]{34,40}\b"),
+        "severity": _SEV_HIGH,
+        "advice": (
+            "Invalidate the token at huggingface.co/settings/tokens and read the "
+            "replacement from the HF_TOKEN environment variable."
+        ),
+    },
+    {
         "name": "AWS access key ID",
-        "regex": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+        # AKIA: long-term IAM user keys; ASIA: temporary STS credentials.
+        "regex": re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
         "severity": _SEV_CRITICAL,
         "advice": (
             "Deactivate this access key in the AWS IAM console and rotate "
@@ -131,6 +207,35 @@ PATTERNS: list[dict] = [
         ),
     },
     {
+        "name": "Azure storage account key",
+        "regex": re.compile(r"AccountKey=([A-Za-z0-9+/]{86}==)"),
+        "group": 1,
+        "severity": _SEV_CRITICAL,
+        "advice": (
+            "Rotate the storage account key in the Azure portal (Access keys) "
+            "and switch to a managed identity or a SAS token read from the "
+            "environment."
+        ),
+    },
+    {
+        "name": "Google API key",
+        "regex": re.compile(r"\bAIza[0-9A-Za-z_-]{35}"),
+        "severity": _SEV_HIGH,
+        "advice": (
+            "Regenerate the key in the Google Cloud Console and add "
+            "application restrictions (HTTP referrer / IP) to the replacement."
+        ),
+    },
+    {
+        "name": "Google OAuth client secret",
+        "regex": re.compile(r"\bGOCSPX-[A-Za-z0-9_-]{28}" + _TOKEN_END),
+        "severity": _SEV_HIGH,
+        "advice": (
+            "Reset the client secret in Google Cloud Console (APIs & Services -> "
+            "Credentials) and load it from the environment."
+        ),
+    },
+    {
         "name": "Stripe live key",
         "regex": re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,255}\b"),
         "severity": _SEV_CRITICAL,
@@ -140,8 +245,58 @@ PATTERNS: list[dict] = [
         ),
     },
     {
+        "name": "Shopify access token",
+        "regex": re.compile(r"\bshp(?:at|ss|ca|pa)_[a-fA-F0-9]{32}\b"),
+        "severity": _SEV_HIGH,
+        "advice": (
+            "Rotate the token from the Shopify admin (Apps -> Develop apps) and "
+            "keep the replacement in an environment variable."
+        ),
+    },
+    {
+        "name": "DigitalOcean token",
+        "regex": re.compile(r"\bdo[opr]_v1_[a-f0-9]{64}\b"),
+        "severity": _SEV_CRITICAL,
+        "advice": (
+            "Revoke the token in the DigitalOcean control panel (API -> Tokens); "
+            "it can create and destroy infrastructure."
+        ),
+    },
+    {
+        "name": "SendGrid API key",
+        # Issued as SG.<22>.<43>; the bounds are a little looser on purpose.
+        "regex": re.compile(r"\bSG\.[A-Za-z0-9_-]{20,24}\.[A-Za-z0-9_-]{39,50}" + _TOKEN_END),
+        "severity": _SEV_HIGH,
+        "advice": (
+            "Delete the key in SendGrid (Settings -> API Keys); a leaked key is "
+            "used to send spam and phishing from your domain."
+        ),
+    },
+    {
+        "name": "npm access token",
+        "regex": re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"),
+        "severity": _SEV_CRITICAL,
+        "advice": (
+            "Revoke the token with `npm token revoke` or on npmjs.com; with "
+            "publish rights it can push malicious versions of your packages."
+        ),
+    },
+    {
+        "name": "PyPI API token",
+        # Macaroons for pypi.org and test.pypi.org start with these base64 headers.
+        "regex": re.compile(
+            r"\bpypi-AgE(?:IcHlwaS5vcmc|NdGVzdC5weXBpLm9yZw)[A-Za-z0-9_-]{50,}" + _TOKEN_END
+        ),
+        "severity": _SEV_CRITICAL,
+        "advice": (
+            "Remove the token in PyPI (Account settings -> API tokens) and "
+            "publish with Trusted Publishing instead of a stored token."
+        ),
+    },
+    {
         "name": "Slack token",
-        "regex": re.compile(r"\bxox[bp]-[A-Za-z0-9-]{10,255}"),
+        # bot/user/app/config/refresh tokens and app-level xapp- tokens
+        "regex": re.compile(r"\b(?:xox[abposre]|xoxe\.xox[bp]|xapp)-[A-Za-z0-9-]{10,255}"),
         "severity": _SEV_HIGH,
         "advice": (
             "Revoke the token from your Slack app management page and store "
@@ -172,12 +327,22 @@ PATTERNS: list[dict] = [
         ),
     },
     {
-        "name": "Google API key",
-        "regex": re.compile(r"\bAIza[0-9A-Za-z_-]{35}"),
+        "name": "Telegram bot token",
+        "regex": re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_-]{33}" + _TOKEN_END),
         "severity": _SEV_HIGH,
         "advice": (
-            "Regenerate the key in the Google Cloud Console and add "
-            "application restrictions (HTTP referrer / IP) to the replacement."
+            "Revoke the token with @BotFather (/revoke) and read the new one "
+            "from an environment variable."
+        ),
+    },
+    {
+        "name": "age secret key",
+        "regex": re.compile(r"\bAGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}\b"),
+        "severity": _SEV_CRITICAL,
+        "advice": (
+            "This key decrypts everything encrypted to its recipient (sops, "
+            "age). Generate a new identity, re-encrypt the secrets to it and "
+            "remove this one from the repository."
         ),
     },
     {
@@ -203,14 +368,34 @@ PATTERNS: list[dict] = [
     },
     {
         "name": "Connection string with credentials",
+        # The password is the reported value, so placeholders are judged on
+        # the password alone: a templated or "example"-looking host no
+        # longer hides a literal password.
         "regex": re.compile(
-            r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|amqp|redis)://[^\s:@/\"']*:[^\s@/\"']+@[^\s\"']+"
+            r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|amqps?|rediss?)://"
+            r"[^\s:@/\"']*:([^\s@/\"']+)@(?P<host>[^\s\"'/:?#]*)"
         ),
+        "group": 1,
+        "skip": _reserved_example_host,
         "severity": _SEV_CRITICAL,
         "advice": (
             "Credentials embedded in connection URLs leak through logs and "
             "shell history. Move the URL to an environment variable and rotate "
             "the password."
+        ),
+    },
+    {
+        "name": "URL with embedded credentials",
+        "regex": re.compile(
+            r"\b(?:https?|ftps?|smtps?)://[^\s:@/\"']+:([^\s@/\"']+)@(?P<host>[^\s\"'/:?#]*)"
+        ),
+        "group": 1,
+        "skip": _reserved_example_host,
+        "severity": _SEV_HIGH,
+        "advice": (
+            "user:password@ in a URL (git remotes, package indexes, webhooks) "
+            "is sent and logged in clear text. Use a credential helper or an "
+            "environment variable, and rotate the password."
         ),
     },
     {
@@ -241,6 +426,7 @@ PATTERNS: list[dict] = [
             r"(?i)(?:password|passwd|secret|api[_-]?key|token)[\"']?\s*[:=]\s*([\"'])((?:(?!\1).){8,512})\1"
         ),
         "group": 2,
+        "assignment": True,
         "severity": _SEV_HIGH,
         "advice": (
             "Move the value to an environment variable or a secrets manager, "
@@ -256,6 +442,7 @@ PATTERNS: list[dict] = [
             r"^\s*(?:export\s+)?[A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY)\s*=\s*([^\s\"'#]{8,512})"
         ),
         "group": 1,
+        "assignment": True,
         "severity": _SEV_HIGH,
         "advice": (
             "This dotenv-style assignment looks like a real credential. Keep "
@@ -267,9 +454,12 @@ PATTERNS: list[dict] = [
 
 # Quoted string of 20+ printable, space-free characters assigned to an
 # identifier (bare or itself quoted, as in JSON keys). Candidates feed the
-# entropy detector only.
+# entropy detector only. The lookbehind makes the identifier start at a word
+# boundary. Without it, every position inside a long run of word characters
+# was a new start, and the cost was quadratic: one 100,000-character line
+# (a minified bundle) took over four minutes.
 _ENTROPY_ASSIGN_RE = re.compile(
-    r"[\"']?[A-Za-z_][A-Za-z0-9_]*[\"']?\s*[:=]\s*[\"']([^\"'\s]{20,2048})[\"']"
+    r"[\"']?(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*[\"']?\s*[:=]\s*[\"']([^\"'\s]{20,2048})[\"']"
 )
 
 # ---------------------------------------------------------------------------
@@ -280,6 +470,28 @@ _ENTROPY_ASSIGN_RE = re.compile(
 
 _MASK_CHARS = set("Xx*.•…")  # X, x, *, ., bullet, ellipsis
 _YOUR_HERE_RE = re.compile(r"(?i)your[-_][a-z0-9_-]*here")
+# $VAR (upper case, so "$ecretPass" is still a password), $(command),
+# PowerShell $env:VAR and cmd.exe %VAR%.
+_SHELL_VAR_RE = re.compile(
+    r"^(?:\$[A-Z_][A-Z0-9_]*|\$\(.*|\$env:[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%)$"
+)
+# Jinja / Ansible / Helm / Go templates / Mustache {{ }}, Jinja {% %},
+# ERB and EJS <% %>, Ruby #{ } interpolation.
+_TEMPLATE_EXPR_RE = re.compile(r"\{\{.*?\}\}|\{%.*?%\}|<%.*?%>|#\{[^}]*\}")
+# Code, not a literal. Kept narrow so that a password with a bracket in it
+# ("Xk9(pq!2Lm") is still a password:
+#   os.getenv(          a call whose quoted argument cut the value short
+#   get_secret()  HOOK[8:]  KEYS[0]     an argument-less call or simple subscript
+#   settings.DB_PASSWORD                a dotted attribute path
+#   ' + pwd + '         one side of a string concatenation
+_CODE_EXPR_RE = re.compile(
+    r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*[(\[]$"
+    r"|^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*(?:\(\)|\[[\w:-]*\])$"
+    r"|^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$"
+    r"|^\s*['\"`]?\s*\+\s|\s\+\s*['\"`]?\s*$"
+)
+# Python %(name)s and str.format / f-string {name} as the whole value.
+_FORMAT_PLACEHOLDER_RE = re.compile(r"^(?:%\([A-Za-z_][A-Za-z0-9_]*\)[sdirf]|\{[A-Za-z_][A-Za-z0-9_.\[\]'\"]*\})$")
 
 
 def _mostly_masked(value: str) -> bool:
@@ -307,7 +519,7 @@ _ALLOWLIST: list[tuple[str, str, Callable[[str], bool]]] = [
     ),
     (
         "example",
-        "Values containing 'example' in any case — covers example.com / example.org domains and vendor-documented sample keys (such as the AWS docs key ending in EXAMPLE).",
+        "Values containing 'example' in any case — vendor-documented sample keys (such as the AWS docs key ending in EXAMPLE). For credentialed URLs only the password is checked.",
         lambda v: "example" in v.lower(),
     ),
     (
@@ -336,18 +548,57 @@ _ALLOWLIST: list[tuple[str, str, Callable[[str], bool]]] = [
         lambda v: "${" in v,
     ),
     (
+        "template-expression",
+        "Values containing a template expression: {{ ... }} (Jinja, Ansible, Helm, Go templates), {% ... %}, <% ... %> (ERB/EJS) or #{...} (Ruby).",
+        lambda v: _TEMPLATE_EXPR_RE.search(v) is not None,
+    ),
+    (
+        "shell-variable",
+        "Values that are only a variable reference: $UPPER_CASE_VAR, $(command), PowerShell $env:VAR or cmd %VAR%.",
+        lambda v: _SHELL_VAR_RE.match(v) is not None,
+    ),
+    (
+        "format-placeholder",
+        "Values that are only a format placeholder: Python %(name)s or {name}.",
+        lambda v: _FORMAT_PLACEHOLDER_RE.match(v) is not None,
+    ),
+    (
         "env-lookup",
         "Values referencing os.environ or process.env — an environment lookup is the fix, not the leak.",
         lambda v: "os.environ" in v or "process.env" in v,
     ),
+    (
+        "code-expression",
+        "Generic assignments only: values that are code rather than a literal — a call or subscript (os.getenv(...), HOOK[8:]), a dotted attribute path (settings.DB_PASSWORD) or one side of a string concatenation (' + pwd + '). Never applied to vendor token formats, which can themselves contain dots.",
+        lambda v: _CODE_EXPR_RE.search(v) is not None,
+    ),
 ]
 
-ALLOWLIST_RULES: list[tuple[str, str]] = [(n, d) for n, d, _ in _ALLOWLIST]
+# Rules that only make sense for the generic detectors (keyword assignments
+# and the entropy fallback). A JWT or a SendGrid key is dot-separated and
+# would otherwise pass for an attribute path.
+_ASSIGNMENT_ONLY_RULES = {"code-expression"}
+
+# Rules that look at the surrounding match instead of the value alone.
+_CONTEXT_RULES: list[tuple[str, str]] = [
+    (
+        "example-host",
+        "Credentialed URLs whose host is a reserved documentation domain (example.com / .net / .org, *.example, *.invalid).",
+    ),
+]
+
+ALLOWLIST_RULES: list[tuple[str, str]] = [(n, d) for n, d, _ in _ALLOWLIST] + _CONTEXT_RULES
 
 
-def allowlist_rule(value: str) -> str | None:
-    """Return the name of the first allowlist rule matching *value*, else None."""
+def allowlist_rule(value: str, *, assignment: bool = True) -> str | None:
+    """Return the name of the first allowlist rule matching *value*, else None.
+
+    ``assignment=False`` leaves out the rules that only apply to generic
+    keyword assignments (see _ASSIGNMENT_ONLY_RULES).
+    """
     for name, _description, predicate in _ALLOWLIST:
+        if not assignment and name in _ASSIGNMENT_ONLY_RULES:
+            continue
         if predicate(value):
             return name
     return None
@@ -378,11 +629,14 @@ def shannon_entropy(s: str) -> float:
 
 
 def redact(value: str) -> str:
-    """Redact a secret: first 4 characters + ellipsis + total length.
+    """Redact a secret: a short prefix + ellipsis + total length.
 
+    The prefix is at most 4 characters and never more than a quarter of the
+    value, so an 8-character password shows 2 characters, not half of it.
     The full value never leaves the scanner in any form.
     """
-    return f"{value[:4]}…({len(value)} chars)"
+    shown = min(4, len(value) // 4)
+    return f"{value[:shown]}…({len(value)} chars)"
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +652,10 @@ def _scan_line(line: str) -> list[dict]:
     """Scan a single line; return raw hits: pattern, severity, advice, value."""
     hits: list[dict] = []
     taken: list[tuple[int, int]] = []
+    # Whole matches a detector recognised but the allowlist dropped. The
+    # entropy fallback must not re-flag them (for example the full URL of a
+    # connection string whose password is a ${VAR}).
+    examined: list[tuple[int, int]] = []
     for pat in PATTERNS:
         for m in pat["regex"].finditer(line):
             group_index = pat.get("group", 0)
@@ -407,7 +665,10 @@ def _scan_line(line: str) -> list[dict]:
             span = m.span(group_index)
             if _overlaps(span, taken):
                 continue  # a more specific detector already claimed this span
-            if allowlist_rule(value) is not None:
+            skip = pat.get("skip")
+            rule = allowlist_rule(value, assignment=pat.get("assignment", False))
+            if rule is not None or (skip is not None and skip(m)):
+                examined.append(m.span())
                 continue
             taken.append(span)
             hits.append(
@@ -422,7 +683,7 @@ def _scan_line(line: str) -> list[dict]:
     for m in _ENTROPY_ASSIGN_RE.finditer(line):
         value = m.group(1)
         span = m.span(1)
-        if len(value) < ENTROPY_MIN_LENGTH or _overlaps(span, taken):
+        if len(value) < ENTROPY_MIN_LENGTH or _overlaps(span, taken) or _overlaps(span, examined):
             continue
         if allowlist_rule(value) is not None:
             continue
@@ -453,36 +714,121 @@ def _finding(source: str, line_no: int, hit: dict, commit: str | None = None) ->
     return entry
 
 
-def _scan_text_lines(text: str, source: str, commit: str | None = None) -> list[dict]:
-    findings: list[dict] = []
-    for line_no, line in enumerate(text.splitlines(), start=1):
-        for hit in _scan_line(line):
-            findings.append(_finding(source, line_no, hit, commit))
-    return findings
+class _Collector:
+    """Accumulates findings, honouring inline suppression comments."""
+
+    def __init__(self) -> None:
+        self.findings: list[dict] = []
+        self.suppressed = 0
+
+    def scan(self, source: str, line_no: int, line: str, commit: str | None = None) -> None:
+        hits = _scan_line(line)
+        if not hits:
+            return
+        if _SUPPRESS_RE.search(line):
+            self.suppressed += len(hits)
+            return
+        for hit in hits:
+            self.findings.append(_finding(source, line_no, hit, commit))
 
 
-def _build_result(findings: list[dict], files_scanned: int) -> dict:
+def _split_lines(text: str) -> list[str]:
+    """Split on "\\n" only, dropping a trailing "\\r" from each line.
+
+    str.splitlines() also breaks on \\f, \\v, \\x1c-\\x1e, \\x85, U+2028 and
+    U+2029, which neither git nor editors count as line breaks, so every
+    such character would shift the reported line numbers.
+    """
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
+
+
+def _scan_text_lines(text: str, source: str, collector: _Collector) -> None:
+    for line_no, line in enumerate(_split_lines(text), start=1):
+        collector.scan(source, line_no, line)
+
+
+def _check_max_findings(max_findings: int | None) -> None:
+    if max_findings is not None and max_findings < 0:
+        raise ValueError("max_findings must be 0 (no limit) or a positive number.")
+
+
+def _build_result(
+    findings: list[dict],
+    files_scanned: int,
+    suppressed: int = 0,
+    max_findings: int | None = None,
+) -> dict:
+    """Assemble the standard report.
+
+    With *max_findings* set (0 or None means no limit), only the most severe
+    findings are listed. The result then says ``truncated: true`` and carries
+    ``total_findings``, ``counts_by_severity``, ``counts_by_pattern`` and
+    ``top_files``, so a noisy tree cannot flood the caller's context window
+    and nothing is lost from the totals.
+    """
     findings = sorted(
         findings,
         key=lambda f: (_SEV_ORDER.get(f["severity"], 9), str(f["file"]), f["line"]),
     )
+    total = len(findings)
     if findings:
         counts = Counter(f["severity"] for f in findings)
-        parts = ", ".join(
-            f"{counts[sev]} {sev}" for sev in (_SEV_CRITICAL, _SEV_HIGH, _SEV_MEDIUM) if counts[sev]
-        )
+        parts = ", ".join(f"{counts[sev]} {sev}" for sev in SEVERITIES if counts[sev])
         summary = (
-            f"Found {len(findings)} potential secret(s) across {files_scanned} scanned "
+            f"Found {total} potential secret(s) across {files_scanned} scanned "
             f"file(s): {parts}. Do NOT commit or push until these are removed or rotated."
         )
     else:
         summary = f"Clean — no secrets detected in {files_scanned} scanned file(s)."
-    return {
+    truncated = bool(max_findings) and total > max_findings
+    result = {
         "clean": not findings,
-        "findings": findings,
+        "findings": findings[:max_findings] if truncated else findings,
         "files_scanned": files_scanned,
         "summary": summary,
     }
+    if suppressed:
+        result["suppressed"] = suppressed
+        result["summary"] += (
+            f" ({suppressed} finding(s) suppressed by inline "
+            "'secret-sentinel: ignore' / 'pragma: allowlist secret' comments.)"
+        )
+    if truncated:
+        by_file = Counter(str(f["file"]) for f in findings)
+        by_severity = Counter(f["severity"] for f in findings)
+        result["truncated"] = True
+        result["total_findings"] = total
+        result["counts_by_severity"] = {s: by_severity[s] for s in SEVERITIES if by_severity[s]}
+        result["counts_by_pattern"] = dict(Counter(f["pattern"] for f in findings).most_common())
+        result["top_files"] = [
+            {"file": name, "findings": n} for name, n in by_file.most_common(10)
+        ]
+        result["summary"] += (
+            f" [listing the {max_findings} most severe of {total}; see counts_by_severity, "
+            "counts_by_pattern and top_files, or raise max_findings]"
+        )
+    return result
+
+
+def merge_results(results: list[dict], max_findings: int | None = None) -> dict:
+    """Combine several uncapped reports (for example one per CLI path) into
+    one, keeping the bracketed notes (skipped files, max_files stops...) of
+    each input summary."""
+    findings = [f for r in results for f in r["findings"]]
+    merged = _build_result(
+        findings,
+        sum(r["files_scanned"] for r in results),
+        sum(r.get("suppressed", 0) for r in results),
+        max_findings,
+    )
+    for r in results:
+        start = r["summary"].find(" [")
+        if start != -1:
+            merged["summary"] += r["summary"][start:]
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -490,19 +836,72 @@ def _build_result(findings: list[dict], files_scanned: int) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def scan_text(text: str, source_name: str = "input") -> dict:
+def scan_text(
+    text: str, source_name: str = "input", max_findings: int = DEFAULT_MAX_FINDINGS
+) -> dict:
     """Scan a snippet of text for exposed secrets.
 
     Args:
         text: Raw text to scan (code, config, log output, ...).
         source_name: Label used in each finding's "file" field.
+        max_findings: List at most this many findings, most severe first
+            (0 = no limit); see _build_result for the summary fields added.
 
     Returns:
         {"clean": bool, "findings": [...], "files_scanned": 1, "summary": str}
-        with every finding redacted (first 4 chars + length).
+        with every finding redacted, plus "suppressed" when inline comments
+        silenced any finding.
     """
-    findings = _scan_text_lines(text, source_name)
-    return _build_result(findings, 1)
+    _check_max_findings(max_findings)
+    collector = _Collector()
+    _scan_text_lines(text, source_name, collector)
+    return _build_result(collector.findings, 1, collector.suppressed, max_findings)
+
+
+# Byte-order marks, longest first (the UTF-32 LE mark starts with UTF-16 LE's).
+_BOMS: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xfe\x00\x00", "utf-32"),
+    (b"\x00\x00\xfe\xff", "utf-32"),
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+    (b"\xff\xfe", "utf-16"),
+    (b"\xfe\xff", "utf-16"),
+)
+
+
+def _bomless_utf16(head: bytes) -> str | None:
+    """Recognise BOM-less UTF-16 text: mostly-ASCII text has a zero in every
+    other byte, which is exactly what the null-byte heuristic trips on."""
+    even, odd = head[0::2], head[1::2]
+    if len(even) < 2 or len(odd) < 2:
+        return None
+    even_zero = even.count(0) / len(even)
+    odd_zero = odd.count(0) / len(odd)
+    if odd_zero >= 0.9 and even_zero <= 0.1:
+        return "utf-16-le"
+    if even_zero >= 0.9 and odd_zero <= 0.1:
+        return "utf-16-be"
+    return None
+
+
+def decode_bytes(data: bytes) -> tuple[str | None, str | None]:
+    """Decode file content for scanning: (text, None) or (None, skip reason).
+
+    A byte-order mark decides the codec first (UTF-8, UTF-16, UTF-32), so
+    UTF-16 files, such as the default output of Windows PowerShell 5.1's
+    ``>`` and ``Out-File``, are scanned instead of being taken for binaries.
+    Otherwise a null byte in the first 8 KiB marks a binary, unless the
+    bytes look like BOM-less UTF-16.
+    """
+    for bom, codec in _BOMS:
+        if data.startswith(bom):
+            return data.decode(codec, errors="replace"), None
+    head = data[:BINARY_SNIFF_BYTES]
+    if b"\x00" in head:
+        codec = _bomless_utf16(head)
+        if codec is None:
+            return None, "binary file (null byte detected)"
+        return data.decode(codec, errors="replace"), None
+    return data.decode("utf-8", errors="replace"), None
 
 
 def _read_text_if_scannable(path: Path) -> tuple[str | None, str | None]:
@@ -510,22 +909,20 @@ def _read_text_if_scannable(path: Path) -> tuple[str | None, str | None]:
     size = path.stat().st_size
     if size > MAX_FILE_BYTES:
         return None, f"file exceeds the 5 MB scan limit ({size} bytes)"
-    with open(path, "rb") as fh:
-        head = fh.read(BINARY_SNIFF_BYTES)
-    if b"\x00" in head:
-        return None, "binary file (null byte detected)"
-    return path.read_text(encoding="utf-8", errors="replace"), None
+    return decode_bytes(path.read_bytes())
 
 
-def scan_file(path: str) -> dict:
+def scan_file(path: str, max_findings: int = DEFAULT_MAX_FINDINGS) -> dict:
     """Scan one file for exposed secrets.
 
-    Binary files (null-byte heuristic on the first 8 KiB) and files over 5 MB
-    are skipped, reported via files_scanned=0 and an explanatory summary.
+    UTF-8, UTF-16 and UTF-32 text is decoded (by byte-order mark). Binary
+    files (null-byte heuristic on the first 8 KiB) and files over 5 MB are
+    skipped, reported via files_scanned=0 and an explanatory summary.
 
     Raises:
         ValueError: if the path does not point at an existing file.
     """
+    _check_max_findings(max_findings)
     target = Path(path).expanduser()
     if not target.is_file():
         raise ValueError(
@@ -539,8 +936,9 @@ def scan_file(path: str) -> dict:
             "files_scanned": 0,
             "summary": f"Skipped {target.name}: {skip_reason}. No text was scanned.",
         }
-    findings = _scan_text_lines(text, str(target))
-    return _build_result(findings, 1)
+    collector = _Collector()
+    _scan_text_lines(text, str(target), collector)
+    return _build_result(collector.findings, 1, collector.suppressed, max_findings)
 
 
 # -- directory scanning ------------------------------------------------------
@@ -553,8 +951,20 @@ EXCLUDED_DIRS = {
     "__pycache__",
     "dist",
     "build",
+    ".tox",
+    ".nox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "site-packages",
+    "__pypackages__",
 }
 LOCKFILE_NAMES = {"package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "bun.lockb"}
+
+
+def _is_environment_dir(path: Path) -> bool:
+    """A virtualenv or conda env under any name (env/, .env39/, py311/...)."""
+    return (path / "pyvenv.cfg").is_file() or (path / "conda-meta").is_dir()
 
 
 def _load_gitignore_patterns(root: Path) -> list[str]:
@@ -563,7 +973,7 @@ def _load_gitignore_patterns(root: Path) -> list[str]:
     gitignore = root / ".gitignore"
     if gitignore.is_file():
         try:
-            for raw in gitignore.read_text(encoding="utf-8", errors="replace").splitlines():
+            for raw in _split_lines(gitignore.read_text(encoding="utf-8", errors="replace")):
                 line = raw.strip()
                 if not line or line.startswith("#") or line.startswith("!"):
                     continue
@@ -597,13 +1007,18 @@ def _matches_gitignore(rel_posix: str, name: str, is_dir: bool, patterns: list[s
     return False
 
 
-def scan_directory(path: str, max_files: int = 500) -> dict:
+def scan_directory(
+    path: str, max_files: int = 500, max_findings: int = DEFAULT_MAX_FINDINGS
+) -> dict:
     """Recursively scan a directory tree for exposed secrets.
 
-    Skips: .git, node_modules, .venv/venv, __pycache__, dist, build,
-    minified JS bundles, lockfiles, binaries, files over 5 MB, and anything
-    matching simple root-.gitignore patterns (best-effort — no negations, no
-    `**`). Findings use forward-slash paths relative to *path*.
+    Skips: .git, node_modules, virtualenvs and conda envs under any name
+    (detected by pyvenv.cfg / conda-meta), .venv/venv, site-packages,
+    __pycache__, tool caches (.tox, .nox, .mypy_cache, .pytest_cache,
+    .ruff_cache), dist, build, minified JS bundles, lockfiles, binaries,
+    files over 5 MB, and anything matching simple root-.gitignore patterns
+    (best-effort — no negations, no `**`). Findings use forward-slash paths
+    relative to *path*.
 
     Raises:
         ValueError: if the directory does not exist or max_files < 1.
@@ -615,11 +1030,13 @@ def scan_directory(path: str, max_files: int = 500) -> dict:
         )
     if max_files < 1:
         raise ValueError("max_files must be at least 1.")
+    _check_max_findings(max_findings)
 
     ignore_patterns = _load_gitignore_patterns(root)
-    findings: list[dict] = []
+    collector = _Collector()
     scanned = 0
     skipped = 0
+    envs_skipped = 0
     truncated = False
 
     for dirpath, dirnames, filenames in os.walk(root):
@@ -628,6 +1045,9 @@ def scan_directory(path: str, max_files: int = 500) -> dict:
         for dirname in sorted(dirnames):
             rel = (rel_dir / dirname).as_posix()
             if dirname in EXCLUDED_DIRS or _matches_gitignore(rel, dirname, True, ignore_patterns):
+                continue
+            if _is_environment_dir(Path(dirpath) / dirname):
+                envs_skipped += 1
                 continue
             kept_dirs.append(dirname)
         dirnames[:] = kept_dirs
@@ -654,16 +1074,18 @@ def scan_directory(path: str, max_files: int = 500) -> dict:
                 skipped += 1
                 continue
             scanned += 1
-            findings.extend(_scan_text_lines(text, rel))
+            _scan_text_lines(text, rel, collector)
         if truncated:
             break
 
-    result = _build_result(findings, scanned)
+    result = _build_result(collector.findings, scanned, collector.suppressed, max_findings)
     notes = []
     if skipped:
         notes.append(
             f"{skipped} file(s) skipped (binaries, oversized, lockfiles, minified, or .gitignore matches)"
         )
+    if envs_skipped:
+        notes.append(f"{envs_skipped} virtualenv/conda environment(s) skipped")
     if truncated:
         notes.append(f"stopped at max_files={max_files} — results may be incomplete")
     if notes:
@@ -675,8 +1097,58 @@ def scan_directory(path: str, max_files: int = 500) -> dict:
 # Git-based scanning
 # ---------------------------------------------------------------------------
 
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _COMMIT_RE = re.compile(r"^commit ([0-9a-f]{6,40})\b")
+_BINARY_RE = re.compile(r"^Binary files (.+) and (.+) differ$")
+
+# Config that is forced on every git call. User and repository config must not
+# change what we parse or make git run programs. Each entry is here for a reason:
+#   core.quotePath=false     non-ASCII paths come out as UTF-8, not "\303\263"
+#   core.fsmonitor=false     the fsmonitor hook is a configurable command
+#   diff.noprefix / diff.mnemonicPrefix / diff.relative
+#                            paths stay "b/<repo-relative path>" for the whole repo
+#   diff.suppressBlankEmpty  an empty line is never a context line
+#   diff.submodule=short     submodule changes stay one "Subproject commit" line
+#   log.showSignature=false  verifying signatures runs gpg.program
+#   log.showRoot=true        the root commit's additions are part of history
+#   color.ui=false           no ANSI escapes in the output we parse
+_GIT_CONFIG = (
+    "core.quotePath=false",
+    "core.fsmonitor=false",
+    "diff.noprefix=false",
+    "diff.mnemonicPrefix=false",
+    "diff.relative=false",
+    "diff.suppressBlankEmpty=false",
+    "diff.submodule=short",
+    "log.showSignature=false",
+    "log.showRoot=true",
+    "color.ui=false",
+)
+
+# Flags for every diff/log call: no external diff programs or textconv
+# filters (diff.external, diff.<driver>.command/textconv would replace the
+# text we scan with their own output), fixed prefixes, zero context.
+_DIFF_FLAGS = (
+    "--no-ext-diff",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--no-color",
+    "-U0",
+    "--inter-hunk-context=0",
+)
+
+# Environment variables that change diff output or start programs.
+_GIT_ENV_DROP = ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "PAGER")
+
+
+def _git_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
+    # Read-only tool: never take optional locks (git diff may otherwise
+    # rewrite the index to refresh stat data) and never prompt.
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
 
 
 def _run_git(repo_path: str, *args: str) -> subprocess.CompletedProcess:
@@ -685,18 +1157,26 @@ def _run_git(repo_path: str, *args: str) -> subprocess.CompletedProcess:
         raise ValueError(
             f"Path not found: {repo_path} — pass an absolute path to a git repository."
         )
+    config_args: list[str] = []
+    for item in _GIT_CONFIG:
+        config_args += ["-c", item]
     try:
         return subprocess.run(
-            ["git", "-C", str(repo), *args],
+            ["git", *config_args, "-C", str(repo), *args],
+            # Never inherit stdin: under an MCP stdio server it is the protocol
+            # pipe. On Windows, duplicating that handle for the child blocks
+            # while the server's reader thread is waiting on it (mcp 1.x hangs
+            # forever), and a child must never consume protocol bytes anyway.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=_git_env(),
         )
     except FileNotFoundError:
         raise ValueError(
-            "git executable not found on PATH — install Git to use "
-            "scan_git_staged / scan_git_history."
+            "git executable not found on PATH — install Git to use the git scans."
         ) from None
 
 
@@ -709,59 +1189,149 @@ def _ensure_git_repo(repo_path: str) -> None:
         )
 
 
-def _scan_diff(diff_text: str) -> tuple[list[dict], set[str]]:
-    """Scan unified diff output (-U0), added lines only.
+_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+_OCTAL_ESCAPE_RE = re.compile(r"[0-3][0-7]{2}")
 
-    Tracks the current file from `+++ b/...` headers, the new-file line number
-    from `@@` hunk headers, and — for `git log` output — the current commit
-    from `commit <hash>` separator lines. Deletions never advance the line
-    counter (correct for zero-context diffs).
+
+def _unquote_git_path(name: str) -> str:
+    """Decode a path git printed in C-quoted form, such as "tab\\there.txt".
+
+    With core.quotePath=false git still quotes names that contain control
+    characters, double quotes or backslashes; octal escapes are raw bytes of
+    the UTF-8 name.
     """
-    findings: list[dict] = []
+    if len(name) < 2 or name[0] != '"' or name[-1] != '"':
+        return name
+    body = name[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        char = body[i]
+        if char == "\\" and i + 1 < len(body):
+            if _OCTAL_ESCAPE_RE.match(body, i + 1):
+                out.append(int(body[i + 1 : i + 4], 8))
+                i += 4
+                continue
+            if body[i + 1] in _C_ESCAPES:
+                out.append(_C_ESCAPES[body[i + 1]])
+                i += 2
+                continue
+        out += char.encode("utf-8", errors="replace")
+        i += 1
+    return out.decode("utf-8", errors="replace")
+
+
+def _diff_target(name: str) -> str | None:
+    """Repo-relative path from the target side of a diff header, or None."""
+    if name.endswith("\t"):  # git appends a tab when the name contains a space
+        name = name[:-1]
+    name = _unquote_git_path(name)
+    if name == "/dev/null":
+        return None
+    return name[2:] if name.startswith("b/") else name
+
+
+def _scan_diff(diff_text: str) -> tuple[_Collector, set[str], list[str]]:
+    """Scan unified diff output (git diff / git log -p, -U0), added lines only.
+
+    A small state machine instead of prefix matching, so that file content
+    can never be mistaken for a header:
+
+    * header state (after ``diff --git`` or ``commit <hash>``): ``+++ b/…``
+      names the file, ``Binary files … differ`` marks a skipped binary.
+    * hunk state (after ``@@ -a,b +c,d @@``): exactly ``b`` removed and ``d``
+      added lines follow, counted down from the hunk header. Every ``+`` line
+      in that window is content, even when it reads ``+++ something``.
+
+    Returns (collector, files with additions, binary files skipped).
+    """
+    collector = _Collector()
     files_seen: set[str] = set()
+    binaries: list[str] = []
     current_file: str | None = None
     current_commit: str | None = None
+    in_header = False
     new_line = 0
+    old_left = new_left = 0
 
-    for raw in diff_text.splitlines():
-        if raw.startswith("+++ "):
-            target = raw[4:].strip()
-            if target == "/dev/null":
-                current_file = None
-            else:
-                current_file = target[2:] if target.startswith(("a/", "b/")) else target
-                files_seen.add(current_file)
-        elif raw.startswith("+"):
-            if current_file is not None:
-                for hit in _scan_line(raw[1:]):
-                    findings.append(_finding(current_file, new_line, hit, commit=current_commit))
-            new_line += 1
-        elif raw.startswith("@@"):
-            match = _HUNK_RE.match(raw)
-            if match:
-                new_line = int(match.group(1))
+    for raw in _split_lines(diff_text):
+        if old_left > 0 or new_left > 0:  # inside a hunk
+            tag = raw[:1]
+            if tag == "+":
+                if current_file is not None:
+                    collector.scan(current_file, new_line, raw[1:], current_commit)
+                new_line += 1
+                new_left -= 1
+                continue
+            if tag == "-":
+                old_left -= 1
+                continue
+            if tag == " ":  # context line (none expected with -U0, handled anyway)
+                new_line += 1
+                new_left -= 1
+                old_left -= 1
+                continue
+            if tag == "\\":  # "\ No newline at end of file"
+                continue
+            old_left = new_left = 0  # malformed hunk: fall through to headers
+
+        if raw.startswith("diff --git "):
+            in_header = True
+            current_file = None
         elif raw.startswith("commit "):
             match = _COMMIT_RE.match(raw)
             if match:
                 current_commit = match.group(1)
                 current_file = None
-        # everything else (deletions, headers) is irrelevant with -U0
-    return findings, files_seen
+                in_header = True
+        elif raw.startswith("@@"):
+            match = _HUNK_RE.match(raw)
+            if match:
+                old_left = int(match.group(1)) if match.group(1) is not None else 1
+                new_line = int(match.group(2))
+                new_left = int(match.group(3)) if match.group(3) is not None else 1
+                in_header = False
+        elif in_header and raw.startswith("+++ "):
+            current_file = _diff_target(raw[4:])
+            if current_file is not None:
+                files_seen.add(current_file)
+        elif in_header and raw.startswith("Binary files "):
+            match = _BINARY_RE.match(raw)
+            if match:
+                target = _diff_target(match.group(2))
+                if target is not None and target not in binaries:
+                    binaries.append(target)
+        # everything else (index, mode, rename, --- lines) carries no content
+    return collector, files_seen, binaries
 
 
-def scan_git_staged(repo_path: str) -> dict:
+def _binary_note(binaries: list[str]) -> str:
+    if not binaries:
+        return ""
+    shown = ", ".join(binaries[:5]) + (", …" if len(binaries) > 5 else "")
+    return f" [{len(binaries)} binary file(s) not scanned: {shown}]"
+
+
+def _has_commits(repo_path: str) -> bool:
+    return _run_git(repo_path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}").returncode == 0
+
+
+def scan_git_staged(repo_path: str, max_findings: int = DEFAULT_MAX_FINDINGS) -> dict:
     """Scan only the lines that `git diff --cached` would add — the exact
     content the next commit would publish.
 
     Findings carry the file path (repo-relative) and the post-commit line
-    number of each added line.
+    number of each added line. Local diff configuration (external diff tools,
+    textconv filters, prefix settings, path quoting) is overridden, so what
+    is scanned is always the staged text itself.
 
     Raises:
         ValueError: if the path is missing, not a git repository, or git is
         not installed.
     """
+    _check_max_findings(max_findings)
     _ensure_git_repo(repo_path)
-    proc = _run_git(repo_path, "diff", "--cached", "-U0", "--no-color")
+    proc = _run_git(repo_path, "diff", "--cached", *_DIFF_FLAGS)
     if proc.returncode != 0:
         raise ValueError(f"'git diff --cached' failed in {repo_path}: {proc.stderr.strip()}")
     if not proc.stdout.strip():
@@ -774,24 +1344,34 @@ def scan_git_staged(repo_path: str) -> dict:
                 "again before committing."
             ),
         }
-    findings, files_seen = _scan_diff(proc.stdout)
-    result = _build_result(findings, len(files_seen))
-    if findings:
+    collector, files_seen, binaries = _scan_diff(proc.stdout)
+    result = _build_result(collector.findings, len(files_seen), collector.suppressed, max_findings)
+    if collector.findings:
         result["summary"] += " Unstage the affected files and strip the secrets before committing."
     else:
         result["summary"] = (
             f"Staged changes are clean — {len(files_seen)} file(s) with additions "
             "scanned, no secrets in the added lines."
         )
+    result["summary"] += _binary_note(binaries)
     return result
 
 
-def scan_git_history(repo_path: str, max_commits: int = 50) -> dict:
+def scan_git_history(
+    repo_path: str,
+    max_commits: int = 50,
+    all_branches: bool = False,
+    max_findings: int = DEFAULT_MAX_FINDINGS,
+) -> dict:
     """Scan the lines added by the last *max_commits* commits.
 
     Each finding is tagged with the (short) commit hash that introduced it.
     Note that removing a secret in a later commit does NOT make it safe:
     history retains it, so rotation is always required.
+
+    Args:
+        all_branches: walk every ref (all branches, tags and the stash)
+            instead of only the history of HEAD.
 
     Raises:
         ValueError: if the path is missing, not a git repository, git is not
@@ -800,32 +1380,113 @@ def scan_git_history(repo_path: str, max_commits: int = 50) -> dict:
     _ensure_git_repo(repo_path)
     if max_commits < 1:
         raise ValueError("max_commits must be at least 1.")
-    proc = _run_git(
-        repo_path,
-        "log",
-        "-p",
-        "-U0",
-        "--no-color",
-        f"-n{max_commits}",
-        "--pretty=format:commit %h",
-    )
+    _check_max_findings(max_findings)
+    if not all_branches and not _has_commits(repo_path):
+        return {
+            "clean": True,
+            "findings": [],
+            "files_scanned": 0,
+            "summary": "Repository has no commits yet — history is empty.",
+        }
+    args = ["log", "-p", *_DIFF_FLAGS, f"-n{max_commits}", "--format=commit %h"]
+    if all_branches:
+        args.append("--all")
+    proc = _run_git(repo_path, *args)
     if proc.returncode != 0:
-        stderr = proc.stderr.strip()
-        if "does not have any commits" in stderr or "bad default revision" in stderr:
-            return {
-                "clean": True,
-                "findings": [],
-                "files_scanned": 0,
-                "summary": "Repository has no commits yet — history is empty.",
-            }
-        raise ValueError(f"'git log' failed in {repo_path}: {stderr}")
-    findings, files_seen = _scan_diff(proc.stdout)
-    result = _build_result(findings, len(files_seen))
-    if findings:
+        raise ValueError(f"'git log' failed in {repo_path}: {proc.stderr.strip()}")
+    collector, files_seen, binaries = _scan_diff(proc.stdout)
+    result = _build_result(collector.findings, len(files_seen), collector.suppressed, max_findings)
+    if collector.findings:
         result["summary"] += (
             " These additions live in commit history: removing the file now is "
             "NOT enough — rotate the affected credentials."
         )
+    result["summary"] += _binary_note(binaries)
+    return result
+
+
+_UPSTREAM_HINT = (
+    "The current branch has no upstream (it was never pushed with -u, or HEAD "
+    "is detached). Pass the branch you are going to push to as base, for "
+    "example base='origin/main'."
+)
+
+
+def _resolve_commit(repo_path: str, rev: str, role: str) -> str:
+    """Resolve *rev* to a full commit hash, rejecting option-like input."""
+    if not rev or rev.startswith("-") or any(c in rev for c in "\0\n\r"):
+        raise ValueError(f"Invalid {role} revision {rev!r}: pass a branch, tag or commit.")
+    proc = _run_git(repo_path, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
+    if proc.returncode != 0:
+        if re.search(r"@\{(?:u|upstream|push)\}", rev, re.IGNORECASE):
+            raise ValueError(_UPSTREAM_HINT)
+        raise ValueError(f"Unknown {role} revision {rev!r} in {repo_path}.")
+    return proc.stdout.strip()
+
+
+def scan_git_range(
+    repo_path: str,
+    base: str = "@{upstream}",
+    head: str = "HEAD",
+    max_commits: int = 200,
+    max_findings: int = DEFAULT_MAX_FINDINGS,
+) -> dict:
+    """Scan the commits in ``base..head`` — by default, what `git push`
+    would publish: every commit on the current branch that its upstream
+    does not have yet.
+
+    Each finding is tagged with the commit that introduced it. The result
+    adds ``commits_scanned`` and ``range`` to the standard report.
+
+    Raises:
+        ValueError: if the path is not a git repository, a revision does not
+        exist (with a hint when there is no upstream), or max_commits < 1.
+    """
+    _ensure_git_repo(repo_path)
+    if max_commits < 1:
+        raise ValueError("max_commits must be at least 1.")
+    _check_max_findings(max_findings)
+    base_sha = _resolve_commit(repo_path, base, "base")
+    head_sha = _resolve_commit(repo_path, head, "head")
+    span = f"{base_sha}..{head_sha}"
+    label = f"{base}..{head}"
+
+    count_proc = _run_git(repo_path, "rev-list", "--count", span)
+    if count_proc.returncode != 0:
+        raise ValueError(f"'git rev-list' failed in {repo_path}: {count_proc.stderr.strip()}")
+    total = int(count_proc.stdout.strip() or 0)
+    if total == 0:
+        return {
+            "clean": True,
+            "findings": [],
+            "files_scanned": 0,
+            "summary": f"Nothing to scan: {head} has no commits that {base} does not already have.",
+            "commits_scanned": 0,
+            "range": label,
+        }
+
+    proc = _run_git(
+        repo_path, "log", "-p", *_DIFF_FLAGS, f"-n{max_commits}", "--format=commit %h", span
+    )
+    if proc.returncode != 0:
+        raise ValueError(f"'git log' failed in {repo_path}: {proc.stderr.strip()}")
+    collector, files_seen, binaries = _scan_diff(proc.stdout)
+    scanned = min(total, max_commits)
+    result = _build_result(collector.findings, len(files_seen), collector.suppressed, max_findings)
+    result["summary"] = f"{scanned} commit(s) in {label}: " + result["summary"]
+    if collector.findings:
+        result["summary"] += (
+            " Rewrite or drop these commits before pushing, and rotate the "
+            "affected credentials."
+        )
+    if total > scanned:
+        result["summary"] += (
+            f" [only the newest {scanned} of {total} commits were scanned — "
+            "raise max_commits for the rest]"
+        )
+    result["summary"] += _binary_note(binaries)
+    result["commits_scanned"] = scanned
+    result["range"] = label
     return result
 
 
@@ -856,4 +1517,12 @@ def list_patterns() -> dict:
         "allowlist_rules": [
             {"name": name, "description": description} for name, description in ALLOWLIST_RULES
         ],
+        "inline_suppression": {
+            "markers": list(SUPPRESSION_MARKERS),
+            "description": (
+                "A line containing one of these markers (usually in a trailing "
+                "comment, case-insensitive) produces no findings; results count "
+                "them in 'suppressed'."
+            ),
+        },
     }
