@@ -688,6 +688,11 @@ def _run_git(repo_path: str, *args: str) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
             ["git", "-C", str(repo), *args],
+            # Never inherit stdin: under an MCP stdio server it is the protocol
+            # pipe. On Windows, duplicating that handle for the child blocks
+            # while the server's reader thread is waiting on it (mcp 1.x hangs
+            # forever), and a child must never consume protocol bytes anyway.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",

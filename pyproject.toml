@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-secret-sentinel"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that scans code for exposed secrets — API keys, tokens, private keys and high-entropy strings — with placeholder-aware allowlisting and redacted reports."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,10 +20,13 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Security",
 ]
-dependencies = ["mcp>=1.2.0"]
+# 1.7 is the first SDK with tool annotations; 2.x renamed FastMCP to
+# MCPServer, which server.py handles. Capped below the next untested major.
+dependencies = ["mcp>=1.7,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
@@ -38,3 +41,6 @@ mcp-secret-sentinel = "mcp_secret_sentinel.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mcp_secret_sentinel"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

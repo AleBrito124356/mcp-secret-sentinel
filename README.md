@@ -3,8 +3,8 @@
 <!-- mcp-name: io.github.AleBrito124356/mcp-secret-sentinel -->
 
 [![tests](https://github.com/AleBrito124356/mcp-secret-sentinel/actions/workflows/tests.yml/badge.svg)](https://github.com/AleBrito124356/mcp-secret-sentinel/actions/workflows/tests.yml)
-[![PyPI](https://img.shields.io/pypi/v/mcp-secret-sentinel)](https://pypi.org/project/mcp-secret-sentinel/)
-[![Python](https://img.shields.io/pypi/pyversions/mcp-secret-sentinel)](https://pypi.org/project/mcp-secret-sentinel/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%E2%80%933.14-blue)](pyproject.toml)
+[![MCP SDK 1.x | 2.x](https://img.shields.io/badge/mcp%20SDK-1.7%2B%20%7C%202.x-6f42c1)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **MCP server that scans code for exposed secrets — API keys, tokens, private keys and high-entropy strings — with placeholder-aware allowlisting and redacted reports.**
@@ -84,16 +84,22 @@ flowchart TD
 
 ## Quickstart
 
-No install needed — `uvx` fetches and runs it:
+The package is not on PyPI yet (the publish workflow runs when a `v*` tag is
+pushed), so install it straight from GitHub. It runs on Python 3.10+ with
+either major of the official MCP SDK (`mcp` 1.7+ or 2.x).
 
-**Claude Desktop** (`claude_desktop_config.json`):
+**Claude Desktop** (`claude_desktop_config.json`), with `uvx` fetching it from git:
 
 ```json
 {
   "mcpServers": {
     "secret-sentinel": {
       "command": "uvx",
-      "args": ["mcp-secret-sentinel"]
+      "args": [
+        "--from",
+        "git+https://github.com/AleBrito124356/mcp-secret-sentinel",
+        "mcp-secret-sentinel"
+      ]
     }
   }
 }
@@ -102,10 +108,16 @@ No install needed — `uvx` fetches and runs it:
 **Claude Code:**
 
 ```bash
-claude mcp add secret-sentinel -- uvx mcp-secret-sentinel
+claude mcp add secret-sentinel -- uvx --from git+https://github.com/AleBrito124356/mcp-secret-sentinel mcp-secret-sentinel
 ```
 
-Prefer a permanent install? `pip install mcp-secret-sentinel`, then use `mcp-secret-sentinel` as the command.
+**Permanent install with pip** (no `uv` needed):
+
+```bash
+pip install "git+https://github.com/AleBrito124356/mcp-secret-sentinel"
+```
+
+Then use `mcp-secret-sentinel` as the command in any MCP client config.
 
 ## Example session
 
@@ -160,7 +172,13 @@ python -m pytest
 
 You can also run the server straight from the source tree with `python -m mcp_secret_sentinel.server`.
 
-The test suite exercises every detector, the allowlist, entropy, redaction, directory walking, and real temporary git repositories — and never contains a realistic secret literal: every positive fixture is assembled at runtime by concatenation.
+The test suite exercises every detector, the allowlist, entropy, redaction, directory walking, and real temporary git repositories — and never contains a realistic secret literal: every positive fixture is assembled at runtime by concatenation. `tests/test_server.py` spawns the real server over stdio and drives it with the SDK's own `ClientSession`, so it proves the wiring on whichever SDK major is installed. To check the other major too:
+
+```bash
+python -m venv .venv-mcp1
+.venv-mcp1/bin/pip install "mcp<2" -e ".[dev]"   # Windows: .venv-mcp1\Scripts\pip
+.venv-mcp1/bin/python -m pytest
+```
 
 ## Related MCP servers
 
