@@ -16,8 +16,8 @@ Secrets rarely leak through hackers; they leak through commits. An agent (or a h
 | Tool | Arguments | Returns |
 |---|---|---|
 | `scan_text` | `text`, `source_name="input"` | Findings for a raw snippet (code, config, diff, logs) |
-| `scan_file` | `path` | Findings for one file; skips binaries (null-byte heuristic) and files over 5 MB |
-| `scan_directory` | `path`, `max_files=500` | Recursive scan; skips `.git`, `node_modules`, virtualenvs, `__pycache__`, `dist`, `build`, minified JS, lockfiles, and honors simple `.gitignore` patterns |
+| `scan_file` | `path` | Findings for one file; decodes UTF-8/16/32 by BOM, skips binaries (null-byte heuristic) and files over 5 MB |
+| `scan_directory` | `path`, `max_files=500` | Recursive scan; skips `.git`, `node_modules`, virtualenvs and conda envs under any name (found by `pyvenv.cfg` / `conda-meta`), `site-packages`, tool caches (`.tox`, `.nox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`), `__pycache__`, `dist`, `build`, minified JS, lockfiles, and honors simple `.gitignore` patterns |
 | `scan_git_staged` | `repo_path` | Scans only the lines added in `git diff --cached` — the exact content the next commit would publish |
 | `scan_git_range` | `repo_path`, `base="@{upstream}"`, `head="HEAD"`, `max_commits=200` | Scans the commits in `base..head` — by default exactly what the next `git push` would publish. Adds `commits_scanned` and `range` to the report |
 | `scan_git_history` | `repo_path`, `max_commits=50`, `all_branches=false` | Scans lines added by the last N commits (of HEAD, or of every branch, tag and the stash), tagging each finding with its commit hash |
@@ -47,9 +47,21 @@ All scan tools return the same shape:
 
 ### What it detects
 
-Nineteen regex detectors: GitHub tokens (classic and fine-grained), OpenAI / Anthropic / NVIDIA / Google / Stripe (live) / Twilio keys, AWS access key IDs and secret access keys, Slack tokens and incoming webhooks, Discord webhooks, JWTs, private key blocks (RSA / EC / OPENSSH / PGP), database and queue connection strings with embedded credentials (Postgres, MySQL, MongoDB, AMQP, Redis), plus generic `password` / `secret` / `token`-style assignments in quoted code and in dotenv-style `UPPER_CASE=value` lines.
+Thirty-three regex detectors:
+
+| Family | Detectors |
+|---|---|
+| Code hosting & packages | GitHub tokens (`ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` and fine-grained `github_pat_`), GitLab tokens (`glpat-`, `glptt-`, `gldt-`, `glrt-`), npm access tokens (`npm_`), PyPI API tokens (`pypi-AgE…`) |
+| AI providers | OpenAI (legacy `sk-…` plus project `sk-proj-`, service-account `sk-svcacct-` and admin `sk-admin-` keys), Anthropic, OpenRouter, Groq, NVIDIA, Hugging Face |
+| Cloud | AWS access key IDs (`AKIA` / `ASIA`) and secret access keys, Azure storage account keys, Google API keys and OAuth client secrets, DigitalOcean tokens |
+| SaaS | Stripe live keys, Shopify tokens, SendGrid keys, Twilio keys and account SIDs, Slack bot/user/app/refresh tokens and incoming webhooks, Discord webhooks, Telegram bot tokens |
+| Keys & tokens | Private key blocks (RSA / EC / DSA / OPENSSH / PGP / encrypted), `age` secret keys, JWTs |
+| Credentials in URLs | Database and queue connection strings (Postgres, MySQL/MariaDB, MongoDB, AMQP, Redis) and `http(s)`/`ftp`/`smtp` URLs with `user:password@` |
+| Generic | `password` / `secret` / `api_key` / `token`-style assignments in quoted code, and dotenv-style `UPPER_CASE=value` lines |
 
 On top of the regexes, a Shannon-entropy detector flags quoted strings of 20+ characters assigned to variables whose empirical entropy reaches **4.5 bits/char** — the signature of random credential material — but only when no specific pattern already claimed that span.
+
+For credentials in URLs the reported value is the **password**, and the allowlist judges the password alone. A templated or look-alike host can no longer hide a literal password: `postgres://app:<literal>@${DB_HOST}/app` and `mysql://root:<literal>@db.examplecorp.net/prod` are both reported.
 
 ### What it deliberately ignores (allowlist)
 
@@ -57,16 +69,35 @@ Each candidate value is checked against these placeholder heuristics before bein
 
 - **Too short** — values under 8 characters are too short to be real credentials.
 - **Masked** — values that are mostly (≥ 80%) `X`, `x`, `*`, or dots: already redacted by a human, including vendor prefixes followed by an `XXXX…` run.
-- **`example`** — any value containing `example` (any case): covers `example.com` / `example.org` domains *and* vendor-documented sample keys, such as the AWS docs key ending in `EXAMPLE`.
+- **`example`** — any value containing `example` (any case), such as vendor-documented sample keys like the AWS docs key ending in `EXAMPLE`.
 - **`placeholder`**, **`changeme`** (also `change-me` / `change_me`) — conventional fill-me-in markers.
 - **your-…-here** — fill-in-the-blank markers.
 - **`<angle brackets>`** — documentation-style placeholders.
 - **`${TEMPLATE_VARIABLES}`** — the secret is injected elsewhere, not stored here.
+- **Template expressions** — `{{ vault_db_password }}` (Jinja, Ansible, Helm, Go templates), `{% … %}`, `<%= … %>` (ERB/EJS) and `#{…}` (Ruby).
+- **Variable references** — a value that is only `$UPPER_CASE_VAR`, `$(command)`, PowerShell `$env:VAR` or cmd `%VAR%`. `$ecretP4ss` is still a password.
+- **Format placeholders** — a value that is only `%(name)s` or `{name}`.
 - **Environment lookups** — values referencing `os.environ` or `process.env`: an environment lookup is the fix, not the leak.
+- **Code, for generic assignments only** — `API_SECRET = os.getenv("API_SECRET")`, `DB_PASSWORD = settings.DATABASE_PASSWORD`, `HOOK = SECRETS[0]` or one side of `"password='" + pwd + "'"`. The rule is narrow on purpose (`"Xk9(pq!2Lm"` is still a password) and never applies to vendor formats such as JWTs, which contain dots.
+- **Reserved documentation hosts** — a credentialed URL pointing at `example.com` / `.net` / `.org`, `*.example` or `*.invalid`.
+
+### Inline suppression
+
+A deliberate fixture or a known-safe line can be silenced where it lives, without renaming variables:
+
+```python
+TEST_DSN = "postgres://ci:ci-only-password@db:5432/test"  # secret-sentinel: ignore
+```
+
+detect-secrets' marker `pragma: allowlist secret` works too, so files already annotated for that tool need no changes. Markers are case-insensitive and cover only their own line, and they also apply to staged and committed lines. Suppressed findings are not hidden silently: the result carries `"suppressed": <count>` and says so in the summary.
+
+### Encodings and line numbers
+
+Files are decoded by byte-order mark (UTF-8, UTF-16 LE/BE, UTF-32) before the binary check, and BOM-less UTF-16 is recognised too. UTF-16 is what Windows PowerShell 5.1's `>` and `Out-File` write, so those files are now scanned instead of being skipped as binaries. Lines are split on `\n` only (a trailing `\r` is dropped). Form feeds, vertical tabs, `\x85`, U+2028 and U+2029 inside a line no longer shift the reported line numbers.
 
 ### Redaction guarantee
 
-Every finding shows only the first 4 characters plus the total length — e.g. `"hook…(77 chars)"`. The full value never appears in the output, the transcript, or the logs. This is enforced in code (a single `redact()` choke point) and in the test suite, which asserts the raw values are absent from serialized results.
+Every finding shows at most the first 4 characters, and never more than a quarter of the value, plus the total length: `"hook…(77 chars)"`, and `"Tr…(8 chars)"` for an 8-character password (0.1.0 showed half of it). The full value never appears in the output, the transcript, or the logs. This is enforced in code (a single `redact()` choke point) and in the test suite, which asserts the raw values are absent from serialized results, including over real MCP stdio.
 
 ### Git scans read the text, not your diff settings
 
@@ -84,15 +115,17 @@ The diff parser is a state machine driven by the hunk line counts, so an added l
 ```mermaid
 flowchart TD
     A[Agent calls a scan tool] --> B{Source}
-    B -->|scan_text / scan_file| C[Split into lines]
-    B -->|scan_directory| D[Walk tree, skip .git, node_modules,<br/>binaries, lockfiles, .gitignore matches] --> C
+    B -->|scan_text / scan_file| C[Decode by BOM, split on newline only]
+    B -->|scan_directory| D[Walk tree, skip .git, node_modules,<br/>virtualenvs, caches, binaries,<br/>lockfiles, .gitignore matches] --> C
     B -->|scan_git_staged / scan_git_range /<br/>scan_git_history| E[git diff / git log -p, zero context,<br/>diff config overridden, no external programs] --> P[Hunk-counting parser:<br/>added lines, real paths, commit tags] --> C
-    C --> F[19 regex detectors,<br/>specific patterns claim spans first]
-    C --> G[Shannon entropy >= 4.5 bits/char<br/>on assigned strings of 20+ chars]
-    F --> H{Allowlist check:<br/>placeholders, masked values,<br/>example domains, env lookups}
+    C --> S{Inline marker?<br/>secret-sentinel: ignore /<br/>pragma: allowlist secret}
+    S -->|yes| U[Counted in suppressed]
+    S -->|no| F[33 regex detectors,<br/>specific patterns claim spans first]
+    S -->|no| G[Shannon entropy >= 4.5 bits/char<br/>on assigned strings of 20+ chars]
+    F --> H{Allowlist check on the value:<br/>placeholders, templates, variables,<br/>masked values, env lookups}
     G --> H
     H -->|placeholder| I[Dropped, not reported]
-    H -->|real candidate| J[Redact: first 4 chars + length]
+    H -->|real candidate| J[Redact: at most 4 chars and<br/>a quarter of the value, + length]
     J --> K[Report: file, line, pattern,<br/>severity, redacted, advice]
 ```
 
@@ -173,6 +206,10 @@ Then use `mcp-secret-sentinel` as the command in any MCP client config.
 - **`.gitignore` support is best-effort**: plain names, `*.ext` globs, `dir/` and `/anchored` patterns from the *root* `.gitignore` only. No `!` negations, no `**` globs, no nested ignore files.
 - **Entropy needs diversity**: empirical per-string entropy maxes out at log2(distinct characters), so a candidate needs at least 23 distinct characters to clear 4.5 bits/char. Short random strings are covered by the regex detectors instead.
 - **Unquoted generic assignments** are only detected in dotenv-style `UPPER_CASE=value` lines — a deliberate trade against false positives in ordinary code.
+- **Line-by-line matching**: a secret split across lines (a PEM body, a string concatenated over several lines) is only caught by its first line, such as the `BEGIN PRIVATE KEY` header.
+- **Inline suppression is same-line only**: a marker on the line above does nothing, because in a zero-context diff that line is usually not visible.
+- **Merge commits are not diffed** (git's default for `git log -p`), so a secret introduced only while resolving a merge conflict is missed by `scan_git_range` and `scan_git_history`. `scan_git_staged` still sees it before the merge commit is made.
+- **Binary files in git are not scanned**. That includes files that `.gitattributes` marks as binary or `-diff`; the summary lists them by name.
 - **Not a CI replacement**: dedicated scanners (gitleaks, trufflehog) with hundreds of rules belong in your pipeline. This server is the fast local checkpoint an agent can run *before* the commit exists.
 
 ## Development

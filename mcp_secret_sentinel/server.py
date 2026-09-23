@@ -73,11 +73,15 @@ def _call(fn: Callable[..., dict], *args: Any) -> dict:
 def scan_text(text: str, source_name: str = "input") -> dict:
     """Scan a snippet of text or code for exposed secrets.
 
-    Detects API keys (GitHub, OpenAI, Anthropic, NVIDIA, AWS, Stripe, Google,
-    Twilio), Slack/Discord tokens and webhooks, JWTs, private key blocks,
-    credentialed connection strings, generic password/secret/token
-    assignments, and high-entropy strings — while skipping obvious
-    placeholders (allowlist).
+    33 detectors: GitHub/GitLab/npm/PyPI tokens, OpenAI (incl. sk-proj-),
+    Anthropic, OpenRouter, Groq, NVIDIA and Hugging Face keys, AWS, Azure,
+    Google, DigitalOcean, Stripe, Shopify, SendGrid, Twilio, Slack, Discord
+    and Telegram credentials, JWTs, private and age keys, credentialed
+    connection strings and URLs, generic password/secret/token assignments,
+    plus high-entropy strings. Placeholders ($VAR, ${VAR}, {{ templates }},
+    %(name)s, changeme, masked values...) are skipped, and a line carrying
+    "secret-sentinel: ignore" or "pragma: allowlist secret" is counted in
+    "suppressed" instead of reported.
 
     Args:
         text: The raw text to scan (code, config, diff output, logs...).
@@ -87,8 +91,8 @@ def scan_text(text: str, source_name: str = "input") -> dict:
         {"clean": bool,
          "findings": [{"file", "line", "pattern", "severity", "redacted", "advice"}],
          "files_scanned": int, "summary": str}
-        Secret values are ALWAYS redacted (first 4 chars + length); the full
-        value is never included in the output.
+        Secret values are ALWAYS redacted (at most 4 chars, never more than a
+        quarter of the value, + length); the full value is never included.
     """
     return _call(core.scan_text, text, source_name)
 
@@ -97,8 +101,9 @@ def scan_text(text: str, source_name: str = "input") -> dict:
 def scan_file(path: str) -> dict:
     """Scan a single file for exposed secrets.
 
-    Binary files (null-byte heuristic) and files larger than 5 MB are skipped
-    and reported as such in the summary.
+    UTF-8, UTF-16 and UTF-32 text is decoded by byte-order mark. Binary files
+    (null-byte heuristic) and files larger than 5 MB are skipped and reported
+    as such in the summary.
 
     Args:
         path: Absolute path to the file to scan.
@@ -114,10 +119,11 @@ def scan_file(path: str) -> dict:
 def scan_directory(path: str, max_files: int = 500) -> dict:
     """Recursively scan a directory tree for exposed secrets.
 
-    Automatically skips .git, node_modules, .venv/venv, __pycache__, dist,
-    build, minified JS bundles, lockfiles, binaries, files over 5 MB, and
-    simple patterns from the root .gitignore (best-effort: no negations, no
-    ** globs).
+    Automatically skips .git, node_modules, virtualenvs and conda envs under
+    any name, site-packages, tool caches (.tox, .nox, .mypy_cache,
+    .pytest_cache, .ruff_cache), __pycache__, dist, build, minified JS
+    bundles, lockfiles, binaries, files over 5 MB, and simple patterns from
+    the root .gitignore (best-effort: no negations, no ** globs).
 
     Args:
         path: Absolute path to the directory to scan.
