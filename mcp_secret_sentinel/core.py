@@ -41,6 +41,7 @@ BINARY_SNIFF_BYTES = 8192          # null-byte heuristic window
 ENTROPY_THRESHOLD = 4.5            # bits per character
 ENTROPY_MIN_LENGTH = 20            # minimum candidate length
 ALLOWLIST_MIN_LENGTH = 8           # values shorter than this are never reported
+DEFAULT_MAX_FINDINGS = 200         # findings listed per report (0 = no limit)
 
 ENTROPY_PATTERN_NAME = "High-entropy string"
 
@@ -85,10 +86,9 @@ def _reserved_example_host(match: re.Match) -> str | None:
 # at the capture group holding the secret value (default: whole match). The
 # allowlist and the redaction both apply to that value only. "assignment"
 # marks the generic keyword detectors, which also get the code-expression
-# allowlist rule. Optional "skip"
-# is a context rule that receives the match and returns a rule name to drop
-# it. Ordered specific-first: later, broader patterns are skipped when an
-# earlier match already claimed the same span on the line.
+# allowlist rule. Optional "skip" is a context rule that receives the match
+# and returns a rule name to drop it. Ordered specific-first: later, broader
+# patterns are skipped when an earlier match already claimed the same span.
 # ---------------------------------------------------------------------------
 
 PATTERNS: list[dict] = [
@@ -750,23 +750,43 @@ def _scan_text_lines(text: str, source: str, collector: _Collector) -> None:
         collector.scan(source, line_no, line)
 
 
-def _build_result(findings: list[dict], files_scanned: int, suppressed: int = 0) -> dict:
+def _check_max_findings(max_findings: int | None) -> None:
+    if max_findings is not None and max_findings < 0:
+        raise ValueError("max_findings must be 0 (no limit) or a positive number.")
+
+
+def _build_result(
+    findings: list[dict],
+    files_scanned: int,
+    suppressed: int = 0,
+    max_findings: int | None = None,
+) -> dict:
+    """Assemble the standard report.
+
+    With *max_findings* set (0 or None means no limit), only the most severe
+    findings are listed. The result then says ``truncated: true`` and carries
+    ``total_findings``, ``counts_by_severity``, ``counts_by_pattern`` and
+    ``top_files``, so a noisy tree cannot flood the caller's context window
+    and nothing is lost from the totals.
+    """
     findings = sorted(
         findings,
         key=lambda f: (_SEV_ORDER.get(f["severity"], 9), str(f["file"]), f["line"]),
     )
+    total = len(findings)
     if findings:
         counts = Counter(f["severity"] for f in findings)
         parts = ", ".join(f"{counts[sev]} {sev}" for sev in SEVERITIES if counts[sev])
         summary = (
-            f"Found {len(findings)} potential secret(s) across {files_scanned} scanned "
+            f"Found {total} potential secret(s) across {files_scanned} scanned "
             f"file(s): {parts}. Do NOT commit or push until these are removed or rotated."
         )
     else:
         summary = f"Clean — no secrets detected in {files_scanned} scanned file(s)."
+    truncated = bool(max_findings) and total > max_findings
     result = {
         "clean": not findings,
-        "findings": findings,
+        "findings": findings[:max_findings] if truncated else findings,
         "files_scanned": files_scanned,
         "summary": summary,
     }
@@ -776,7 +796,39 @@ def _build_result(findings: list[dict], files_scanned: int, suppressed: int = 0)
             f" ({suppressed} finding(s) suppressed by inline "
             "'secret-sentinel: ignore' / 'pragma: allowlist secret' comments.)"
         )
+    if truncated:
+        by_file = Counter(str(f["file"]) for f in findings)
+        by_severity = Counter(f["severity"] for f in findings)
+        result["truncated"] = True
+        result["total_findings"] = total
+        result["counts_by_severity"] = {s: by_severity[s] for s in SEVERITIES if by_severity[s]}
+        result["counts_by_pattern"] = dict(Counter(f["pattern"] for f in findings).most_common())
+        result["top_files"] = [
+            {"file": name, "findings": n} for name, n in by_file.most_common(10)
+        ]
+        result["summary"] += (
+            f" [listing the {max_findings} most severe of {total}; see counts_by_severity, "
+            "counts_by_pattern and top_files, or raise max_findings]"
+        )
     return result
+
+
+def merge_results(results: list[dict], max_findings: int | None = None) -> dict:
+    """Combine several uncapped reports (for example one per CLI path) into
+    one, keeping the bracketed notes (skipped files, max_files stops...) of
+    each input summary."""
+    findings = [f for r in results for f in r["findings"]]
+    merged = _build_result(
+        findings,
+        sum(r["files_scanned"] for r in results),
+        sum(r.get("suppressed", 0) for r in results),
+        max_findings,
+    )
+    for r in results:
+        start = r["summary"].find(" [")
+        if start != -1:
+            merged["summary"] += r["summary"][start:]
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -784,21 +836,26 @@ def _build_result(findings: list[dict], files_scanned: int, suppressed: int = 0)
 # ---------------------------------------------------------------------------
 
 
-def scan_text(text: str, source_name: str = "input") -> dict:
+def scan_text(
+    text: str, source_name: str = "input", max_findings: int = DEFAULT_MAX_FINDINGS
+) -> dict:
     """Scan a snippet of text for exposed secrets.
 
     Args:
         text: Raw text to scan (code, config, log output, ...).
         source_name: Label used in each finding's "file" field.
+        max_findings: List at most this many findings, most severe first
+            (0 = no limit); see _build_result for the summary fields added.
 
     Returns:
         {"clean": bool, "findings": [...], "files_scanned": 1, "summary": str}
         with every finding redacted, plus "suppressed" when inline comments
         silenced any finding.
     """
+    _check_max_findings(max_findings)
     collector = _Collector()
     _scan_text_lines(text, source_name, collector)
-    return _build_result(collector.findings, 1, collector.suppressed)
+    return _build_result(collector.findings, 1, collector.suppressed, max_findings)
 
 
 # Byte-order marks, longest first (the UTF-32 LE mark starts with UTF-16 LE's).
@@ -855,7 +912,7 @@ def _read_text_if_scannable(path: Path) -> tuple[str | None, str | None]:
     return decode_bytes(path.read_bytes())
 
 
-def scan_file(path: str) -> dict:
+def scan_file(path: str, max_findings: int = DEFAULT_MAX_FINDINGS) -> dict:
     """Scan one file for exposed secrets.
 
     UTF-8, UTF-16 and UTF-32 text is decoded (by byte-order mark). Binary
@@ -865,6 +922,7 @@ def scan_file(path: str) -> dict:
     Raises:
         ValueError: if the path does not point at an existing file.
     """
+    _check_max_findings(max_findings)
     target = Path(path).expanduser()
     if not target.is_file():
         raise ValueError(
@@ -880,7 +938,7 @@ def scan_file(path: str) -> dict:
         }
     collector = _Collector()
     _scan_text_lines(text, str(target), collector)
-    return _build_result(collector.findings, 1, collector.suppressed)
+    return _build_result(collector.findings, 1, collector.suppressed, max_findings)
 
 
 # -- directory scanning ------------------------------------------------------
@@ -949,7 +1007,9 @@ def _matches_gitignore(rel_posix: str, name: str, is_dir: bool, patterns: list[s
     return False
 
 
-def scan_directory(path: str, max_files: int = 500) -> dict:
+def scan_directory(
+    path: str, max_files: int = 500, max_findings: int = DEFAULT_MAX_FINDINGS
+) -> dict:
     """Recursively scan a directory tree for exposed secrets.
 
     Skips: .git, node_modules, virtualenvs and conda envs under any name
@@ -970,6 +1030,7 @@ def scan_directory(path: str, max_files: int = 500) -> dict:
         )
     if max_files < 1:
         raise ValueError("max_files must be at least 1.")
+    _check_max_findings(max_findings)
 
     ignore_patterns = _load_gitignore_patterns(root)
     collector = _Collector()
@@ -1017,7 +1078,7 @@ def scan_directory(path: str, max_files: int = 500) -> dict:
         if truncated:
             break
 
-    result = _build_result(collector.findings, scanned, collector.suppressed)
+    result = _build_result(collector.findings, scanned, collector.suppressed, max_findings)
     notes = []
     if skipped:
         notes.append(
@@ -1255,7 +1316,7 @@ def _has_commits(repo_path: str) -> bool:
     return _run_git(repo_path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}").returncode == 0
 
 
-def scan_git_staged(repo_path: str) -> dict:
+def scan_git_staged(repo_path: str, max_findings: int = DEFAULT_MAX_FINDINGS) -> dict:
     """Scan only the lines that `git diff --cached` would add — the exact
     content the next commit would publish.
 
@@ -1268,6 +1329,7 @@ def scan_git_staged(repo_path: str) -> dict:
         ValueError: if the path is missing, not a git repository, or git is
         not installed.
     """
+    _check_max_findings(max_findings)
     _ensure_git_repo(repo_path)
     proc = _run_git(repo_path, "diff", "--cached", *_DIFF_FLAGS)
     if proc.returncode != 0:
@@ -1283,7 +1345,7 @@ def scan_git_staged(repo_path: str) -> dict:
             ),
         }
     collector, files_seen, binaries = _scan_diff(proc.stdout)
-    result = _build_result(collector.findings, len(files_seen), collector.suppressed)
+    result = _build_result(collector.findings, len(files_seen), collector.suppressed, max_findings)
     if collector.findings:
         result["summary"] += " Unstage the affected files and strip the secrets before committing."
     else:
@@ -1295,7 +1357,12 @@ def scan_git_staged(repo_path: str) -> dict:
     return result
 
 
-def scan_git_history(repo_path: str, max_commits: int = 50, all_branches: bool = False) -> dict:
+def scan_git_history(
+    repo_path: str,
+    max_commits: int = 50,
+    all_branches: bool = False,
+    max_findings: int = DEFAULT_MAX_FINDINGS,
+) -> dict:
     """Scan the lines added by the last *max_commits* commits.
 
     Each finding is tagged with the (short) commit hash that introduced it.
@@ -1313,6 +1380,7 @@ def scan_git_history(repo_path: str, max_commits: int = 50, all_branches: bool =
     _ensure_git_repo(repo_path)
     if max_commits < 1:
         raise ValueError("max_commits must be at least 1.")
+    _check_max_findings(max_findings)
     if not all_branches and not _has_commits(repo_path):
         return {
             "clean": True,
@@ -1327,7 +1395,7 @@ def scan_git_history(repo_path: str, max_commits: int = 50, all_branches: bool =
     if proc.returncode != 0:
         raise ValueError(f"'git log' failed in {repo_path}: {proc.stderr.strip()}")
     collector, files_seen, binaries = _scan_diff(proc.stdout)
-    result = _build_result(collector.findings, len(files_seen), collector.suppressed)
+    result = _build_result(collector.findings, len(files_seen), collector.suppressed, max_findings)
     if collector.findings:
         result["summary"] += (
             " These additions live in commit history: removing the file now is "
@@ -1361,6 +1429,7 @@ def scan_git_range(
     base: str = "@{upstream}",
     head: str = "HEAD",
     max_commits: int = 200,
+    max_findings: int = DEFAULT_MAX_FINDINGS,
 ) -> dict:
     """Scan the commits in ``base..head`` — by default, what `git push`
     would publish: every commit on the current branch that its upstream
@@ -1376,6 +1445,7 @@ def scan_git_range(
     _ensure_git_repo(repo_path)
     if max_commits < 1:
         raise ValueError("max_commits must be at least 1.")
+    _check_max_findings(max_findings)
     base_sha = _resolve_commit(repo_path, base, "base")
     head_sha = _resolve_commit(repo_path, head, "head")
     span = f"{base_sha}..{head_sha}"
@@ -1402,7 +1472,7 @@ def scan_git_range(
         raise ValueError(f"'git log' failed in {repo_path}: {proc.stderr.strip()}")
     collector, files_seen, binaries = _scan_diff(proc.stdout)
     scanned = min(total, max_commits)
-    result = _build_result(collector.findings, len(files_seen), collector.suppressed)
+    result = _build_result(collector.findings, len(files_seen), collector.suppressed, max_findings)
     result["summary"] = f"{scanned} commit(s) in {label}: " + result["summary"]
     if collector.findings:
         result["summary"] += (

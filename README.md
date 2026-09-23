@@ -7,7 +7,7 @@
 [![MCP SDK 1.x | 2.x](https://img.shields.io/badge/mcp%20SDK-1.7%2B%20%7C%202.x-6f42c1)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**MCP server that scans code for exposed secrets — API keys, tokens, private keys and high-entropy strings — with placeholder-aware allowlisting and redacted reports.**
+**MCP server and CLI that scans code for exposed secrets — API keys, tokens, private keys and high-entropy strings — with placeholder-aware allowlisting and redacted reports.**
 
 Secrets rarely leak through hackers; they leak through commits. An agent (or a human in a hurry) pastes a webhook URL into a config, stages it, pushes — and from that moment the credential is compromised, even if the next commit deletes it, because history keeps every added line. mcp-secret-sentinel gives an agent a pre-commit checkpoint: scan a snippet, a file, a whole tree, the staged diff, the commits you are about to push, or recent history, and get back a severity-ranked, fully redacted report it can act on *before* anything leaves the machine. The full secret value never appears in the tool output, so it never enters the conversation transcript either.
 
@@ -15,12 +15,12 @@ Secrets rarely leak through hackers; they leak through commits. An agent (or a h
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `scan_text` | `text`, `source_name="input"` | Findings for a raw snippet (code, config, diff, logs) |
-| `scan_file` | `path` | Findings for one file; decodes UTF-8/16/32 by BOM, skips binaries (null-byte heuristic) and files over 5 MB |
-| `scan_directory` | `path`, `max_files=500` | Recursive scan; skips `.git`, `node_modules`, virtualenvs and conda envs under any name (found by `pyvenv.cfg` / `conda-meta`), `site-packages`, tool caches (`.tox`, `.nox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`), `__pycache__`, `dist`, `build`, minified JS, lockfiles, and honors simple `.gitignore` patterns |
-| `scan_git_staged` | `repo_path` | Scans only the lines added in `git diff --cached` — the exact content the next commit would publish |
-| `scan_git_range` | `repo_path`, `base="@{upstream}"`, `head="HEAD"`, `max_commits=200` | Scans the commits in `base..head` — by default exactly what the next `git push` would publish. Adds `commits_scanned` and `range` to the report |
-| `scan_git_history` | `repo_path`, `max_commits=50`, `all_branches=false` | Scans lines added by the last N commits (of HEAD, or of every branch, tag and the stash), tagging each finding with its commit hash |
+| `scan_text` | `text`, `source_name="input"`, `max_findings=200` | Findings for a raw snippet (code, config, diff, logs) |
+| `scan_file` | `path`, `max_findings=200` | Findings for one file; decodes UTF-8/16/32 by BOM, skips binaries (null-byte heuristic) and files over 5 MB |
+| `scan_directory` | `path`, `max_files=500`, `max_findings=200` | Recursive scan; skips `.git`, `node_modules`, virtualenvs and conda envs under any name (found by `pyvenv.cfg` / `conda-meta`), `site-packages`, tool caches (`.tox`, `.nox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`), `__pycache__`, `dist`, `build`, minified JS, lockfiles, and honors simple `.gitignore` patterns |
+| `scan_git_staged` | `repo_path`, `max_findings=200` | Scans only the lines added in `git diff --cached` — the exact content the next commit would publish |
+| `scan_git_range` | `repo_path`, `base="@{upstream}"`, `head="HEAD"`, `max_commits=200`, `max_findings=200` | Scans the commits in `base..head` — by default exactly what the next `git push` would publish. Adds `commits_scanned` and `range` to the report |
+| `scan_git_history` | `repo_path`, `max_commits=50`, `all_branches=false`, `max_findings=200` | Scans lines added by the last N commits (of HEAD, or of every branch, tag and the stash), tagging each finding with its commit hash |
 | `list_patterns` | — | Active detectors with severity and remediation advice, plus the allowlist rules |
 
 Every tool is annotated read-only (`readOnlyHint`, no open-world access), so MCP clients can run it without a confirmation prompt.
@@ -42,6 +42,23 @@ All scan tools return the same shape:
   ],
   "files_scanned": 6,
   "summary": "Found 1 potential secret(s) across 6 scanned file(s): 1 high. Do NOT commit or push until these are removed or rotated."
+}
+```
+
+`suppressed` is added when inline comments silenced findings (see below).
+
+**Bounded responses.** A noisy tree used to return every finding. 3,000 hits made a 1 MB tool result that swamped the agent's context. Every scan tool now lists at most `max_findings` findings (default 200, most severe first, `0` = no limit). When it has to cut, the report says so and keeps the totals:
+
+```json
+{
+  "clean": false,
+  "findings": ["…the 200 most severe…"],
+  "truncated": true,
+  "total_findings": 3001,
+  "counts_by_severity": {"critical": 1, "high": 3000},
+  "counts_by_pattern": {"Generic secret assignment": 3000, "Stripe live key": 1},
+  "top_files": [{"file": "fixtures/users.py", "findings": 3001}],
+  "summary": "Found 3001 potential secret(s) … [listing the 200 most severe of 3001; see counts_by_severity, counts_by_pattern and top_files, or raise max_findings]"
 }
 ```
 
@@ -166,6 +183,74 @@ pip install "git+https://github.com/AleBrito124356/mcp-secret-sentinel"
 
 Then use `mcp-secret-sentinel` as the command in any MCP client config.
 
+## Command line, git hook and CI
+
+The same scanner works without an MCP client. `mcp-secret-sentinel` with **no arguments still starts the stdio server**, so existing client configs are unchanged. With a command it becomes a CLI:
+
+```bash
+mcp-secret-sentinel scan                       # the current directory
+mcp-secret-sentinel scan src config/app.yaml   # files and directories
+git diff | mcp-secret-sentinel scan -          # stdin
+mcp-secret-sentinel scan --staged              # what the next commit would add
+mcp-secret-sentinel scan --range               # what the next push would publish (@{upstream}..HEAD)
+mcp-secret-sentinel scan --range origin/main..HEAD
+mcp-secret-sentinel scan --history 100 --all-branches
+mcp-secret-sentinel scan --format sarif -o secrets.sarif
+mcp-secret-sentinel patterns                   # detectors, allowlist rules, suppression markers
+```
+
+```text
+$ mcp-secret-sentinel scan src
+src/billing.py:2  [critical] Stripe live key  sk_l…(32 chars)
+    Roll the key in the Stripe Dashboard (Developers -> API keys). Live keys grant access to real payment data.
+src/notify.py:3  [high] Slack incoming webhook  hook…(69 chars)
+    Anyone with this URL can post messages to your workspace. Regenerate the webhook in your Slack app settings and load the URL from an environment variable.
+
+Found 2 potential secret(s) across 2 scanned file(s): 1 critical, 1 high. Do NOT commit or push until these are removed or rotated.
+```
+
+| Option | Meaning |
+|---|---|
+| `--format text\|json\|sarif` | Human report (default), the MCP JSON report, or SARIF 2.1.0 |
+| `--fail-on critical\|high\|medium` | Lowest severity that makes the exit status 1 (default `medium`, i.e. any finding). Findings cut by `--max-findings` still count |
+| `--max-findings N` | List at most N findings, most severe first (default 200; `0` = no limit; SARIF lists everything unless set) |
+| `--max-files N` | Stop a directory scan after N files (default 5000) |
+| `--max-commits N` | With `--range`: scan at most the N newest commits (default 200) |
+| `-o, --output FILE` | Write the report to a file; the one-line summary goes to stderr |
+
+**Exit status:** `0` clean (or only findings below `--fail-on`), `1` findings at or above `--fail-on`, `2` usage error (bad option, missing path, not a git repository, unknown revision). Paths in the report are relative to the working directory, which is what editors and SARIF viewers expect. Output is redacted in every format.
+
+### Block commits with a git hook
+
+```bash
+mcp-secret-sentinel install-hook            # in the repository, or: install-hook path/to/repo
+```
+
+This writes `.git/hooks/pre-commit`, or the directory `core.hooksPath` points at. The hook runs `scan --staged` with the Python that installed it, so a commit is refused while its staged lines contain a secret, and `git commit --no-verify` skips it once. The installer never overwrites a hook written by another tool unless you pass `--force`, and then it keeps the old hook as `pre-commit.bak`. `--fail-on high` makes the hook ignore medium findings.
+
+With the [pre-commit](https://pre-commit.com) framework, add this to `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/AleBrito124356/mcp-secret-sentinel
+    rev: main   # pin a commit SHA (or a v* tag once one is published)
+    hooks:
+      - id: secret-sentinel
+```
+
+### GitHub code scanning
+
+`--format sarif` produces a SARIF 2.1.0 log (checked against the official JSON schema). It has one rule per detector with `security-severity`, a redacted message, a `startLine` per result and a stable fingerprint, so findings show up as code scanning alerts. A workflow step for your own repository:
+
+```yaml
+- run: pip install "git+https://github.com/AleBrito124356/mcp-secret-sentinel"
+- run: mcp-secret-sentinel scan --format sarif -o secret-sentinel.sarif --fail-on critical
+- uses: github/codeql-action/upload-sarif@v3
+  if: always()
+  with:
+    sarif_file: secret-sentinel.sarif
+```
+
 ## Example session
 
 > **User:** I'm about to push acme-app — make sure I'm not leaking anything.
@@ -221,9 +306,16 @@ pip install -e ".[dev]"
 python -m pytest
 ```
 
-You can also run the server straight from the source tree with `python -m mcp_secret_sentinel.server`.
+From the source tree, `python -m mcp_secret_sentinel` runs the CLI (the MCP server with no arguments), and `python -m mcp_secret_sentinel.server` always runs the server.
 
-The test suite exercises every detector, the allowlist, entropy, redaction, directory walking, and real temporary git repositories — and never contains a realistic secret literal: every positive fixture is assembled at runtime by concatenation. `tests/test_server.py` spawns the real server over stdio and drives it with the SDK's own `ClientSession`, so it proves the wiring on whichever SDK major is installed. To check the other major too:
+The test suite never contains a realistic secret literal: every positive fixture is assembled at runtime by concatenation. A test scans this repository and requires it to be clean. The suite is organised as follows:
+
+- `tests/test_core.py` and `tests/test_detection.py` cover every detector, the allowlist and placeholder syntaxes, entropy, redaction, encodings, line numbering, directory walking, inline suppression and a linear-time bound for long lines.
+- `tests/test_git.py` uses real temporary repositories and a local bare remote. It checks diff configuration overrides (a marker file proves `diff.external` and textconv programs never run), path quoting, hunk parsing, `--all` and range scans.
+- `tests/test_cli.py` runs the CLI as a subprocess: exit codes, `--fail-on`, JSON and SARIF, stdin, legacy console encodings, and `install-hook` blocking a real `git commit`.
+- `tests/test_server.py` spawns the real server over stdio and drives it with the SDK's own `ClientSession`, so it proves the wiring on whichever SDK major is installed.
+
+To check the other SDK major too:
 
 ```bash
 python -m venv .venv-mcp1

@@ -101,36 +101,40 @@ def session(tmp_path_factory):
         "scan_git_history": ("scan_git_history", {"repo_path": str(history), "max_commits": 5}),
         "scan_git_range": ("scan_git_range", {"repo_path": str(ranged), "base": "HEAD~1"}),
         "range_no_upstream": ("scan_git_range", {"repo_path": str(ranged)}),
+        "scan_text_capped": (
+            "scan_text",
+            {"text": "\n".join([GENERIC_LINE, SLACK_HOOK_LINE, STRIPE_LINE]), "max_findings": 1},
+        ),
         "list_patterns": ("list_patterns", {}),
         "missing_file": ("scan_file", {"path": str(work / "missing.txt")}),
         "not_a_repo": ("scan_git_staged", {"repo_path": str(plain)}),
     }
 
-    env = {
+    env = _server_env(work)
+    return anyio.run(_drive, ["-m", "mcp_secret_sentinel.server"], env, work, calls)
+
+
+def _server_env(work) -> dict:
+    return {
         **os.environ,
         "PYTHONPATH": str(ROOT),
         # Keep git from walking up out of the temp dir into a real repository.
         "GIT_CEILING_DIRECTORIES": str(work),
     }
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "mcp_secret_sentinel.server"],
-        env=env,
-        cwd=str(ROOT),
-    )
 
-    async def run():
-        with anyio.fail_after(90), open(work / "server-stderr.log", "w", encoding="utf-8") as errlog:
-            async with stdio_client(params, errlog=errlog) as (read, write):
-                async with ClientSession(read, write) as client:
-                    init = await client.initialize()
-                    tools = await client.list_tools()
-                    results = {}
-                    for key, (name, arguments) in calls.items():
-                        results[key] = await client.call_tool(name, arguments)
-                    return {"init": init, "tools": tools.tools, "results": results}
 
-    return anyio.run(run)
+async def _drive(args: list, env: dict, work, calls: dict) -> dict:
+    """Start the server with *args*, initialize, list tools, run *calls*."""
+    params = StdioServerParameters(command=sys.executable, args=args, env=env, cwd=str(ROOT))
+    with anyio.fail_after(90), open(work / "server-stderr.log", "a", encoding="utf-8") as errlog:
+        async with stdio_client(params, errlog=errlog) as (read, write):
+            async with ClientSession(read, write) as client:
+                init = await client.initialize()
+                tools = await client.list_tools()
+                results = {}
+                for key, (name, arguments) in calls.items():
+                    results[key] = await client.call_tool(name, arguments)
+                return {"init": init, "tools": tools.tools, "results": results}
 
 
 def test_initialize_reports_server_and_instructions(session):
@@ -194,6 +198,23 @@ def test_scan_git_range_over_stdio(session):
     no_upstream = session["results"]["range_no_upstream"]
     assert _attr(no_upstream, "isError", "is_error") is True
     assert "origin/main" in _text(no_upstream)
+
+
+def test_max_findings_over_stdio(session):
+    payload = _payload(session["results"]["scan_text_capped"])
+    assert payload["truncated"] is True
+    assert payload["total_findings"] == 3
+    assert [f["pattern"] for f in payload["findings"]] == ["Stripe live key"]
+    assert payload["counts_by_severity"] == {"critical": 1, "high": 2}
+
+
+def test_console_entry_without_arguments_still_serves_mcp(tmp_path):
+    """`mcp-secret-sentinel` with no arguments is what MCP client configs run:
+    it must keep starting the stdio server now that the CLI exists."""
+    calls = {"scan_text": ("scan_text", {"text": GENERIC_LINE})}
+    session = anyio.run(_drive, ["-m", "mcp_secret_sentinel"], _server_env(tmp_path), tmp_path, calls)
+    assert {tool.name for tool in session["tools"]} == EXPECTED_TOOLS
+    assert _payload(session["results"]["scan_text"])["clean"] is False
 
 
 def test_list_patterns_over_stdio(session):

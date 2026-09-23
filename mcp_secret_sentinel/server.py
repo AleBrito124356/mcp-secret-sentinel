@@ -70,7 +70,9 @@ def _call(fn: Callable[..., dict], *args: Any) -> dict:
 
 
 @mcp.tool(annotations=_READ_ONLY)
-def scan_text(text: str, source_name: str = "input") -> dict:
+def scan_text(
+    text: str, source_name: str = "input", max_findings: int = core.DEFAULT_MAX_FINDINGS
+) -> dict:
     """Scan a snippet of text or code for exposed secrets.
 
     33 detectors: GitHub/GitLab/npm/PyPI tokens, OpenAI (incl. sk-proj-),
@@ -86,6 +88,10 @@ def scan_text(text: str, source_name: str = "input") -> dict:
     Args:
         text: The raw text to scan (code, config, diff output, logs...).
         source_name: Label used in each finding's "file" field.
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
 
     Returns:
         {"clean": bool,
@@ -94,11 +100,11 @@ def scan_text(text: str, source_name: str = "input") -> dict:
         Secret values are ALWAYS redacted (at most 4 chars, never more than a
         quarter of the value, + length); the full value is never included.
     """
-    return _call(core.scan_text, text, source_name)
+    return _call(core.scan_text, text, source_name, max_findings)
 
 
 @mcp.tool(annotations=_READ_ONLY)
-def scan_file(path: str) -> dict:
+def scan_file(path: str, max_findings: int = core.DEFAULT_MAX_FINDINGS) -> dict:
     """Scan a single file for exposed secrets.
 
     UTF-8, UTF-16 and UTF-32 text is decoded by byte-order mark. Binary files
@@ -107,16 +113,22 @@ def scan_file(path: str) -> dict:
 
     Args:
         path: Absolute path to the file to scan.
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
 
     Returns:
         The standard redacted findings report (see scan_text). Returns an
         error result if the file does not exist.
     """
-    return _call(core.scan_file, path)
+    return _call(core.scan_file, path, max_findings)
 
 
 @mcp.tool(annotations=_READ_ONLY)
-def scan_directory(path: str, max_files: int = 500) -> dict:
+def scan_directory(
+    path: str, max_files: int = 500, max_findings: int = core.DEFAULT_MAX_FINDINGS
+) -> dict:
     """Recursively scan a directory tree for exposed secrets.
 
     Automatically skips .git, node_modules, virtualenvs and conda envs under
@@ -128,16 +140,20 @@ def scan_directory(path: str, max_files: int = 500) -> dict:
     Args:
         path: Absolute path to the directory to scan.
         max_files: Stop after scanning this many files (default 500).
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
 
     Returns:
         The standard redacted findings report; finding paths are relative to
         the scanned root, using forward slashes.
     """
-    return _call(core.scan_directory, path, max_files)
+    return _call(core.scan_directory, path, max_files, max_findings)
 
 
 @mcp.tool(annotations=_READ_ONLY)
-def scan_git_staged(repo_path: str) -> dict:
+def scan_git_staged(repo_path: str, max_findings: int = core.DEFAULT_MAX_FINDINGS) -> dict:
     """Scan ONLY the lines currently staged for commit (git diff --cached).
 
     This is the pre-commit checkpoint: it inspects exactly the content the
@@ -148,16 +164,25 @@ def scan_git_staged(repo_path: str) -> dict:
 
     Args:
         repo_path: Absolute path to a git repository (or any path inside one).
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
 
     Returns:
         The standard redacted findings report. If nothing is staged the result
         is clean with an explanatory summary.
     """
-    return _call(core.scan_git_staged, repo_path)
+    return _call(core.scan_git_staged, repo_path, max_findings)
 
 
 @mcp.tool(annotations=_READ_ONLY)
-def scan_git_history(repo_path: str, max_commits: int = 50, all_branches: bool = False) -> dict:
+def scan_git_history(
+    repo_path: str,
+    max_commits: int = 50,
+    all_branches: bool = False,
+    max_findings: int = core.DEFAULT_MAX_FINDINGS,
+) -> dict:
     """Scan the lines added by the most recent commits (git log -p).
 
     Each finding is tagged with the short hash of the commit that introduced
@@ -169,12 +194,16 @@ def scan_git_history(repo_path: str, max_commits: int = 50, all_branches: bool =
         max_commits: How many commits back to inspect (default 50).
         all_branches: Walk every branch, tag and the stash instead of only
             the history of HEAD (default false).
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
 
     Returns:
         The standard redacted findings report, with a "commit" field on each
         finding.
     """
-    return _call(core.scan_git_history, repo_path, max_commits, all_branches)
+    return _call(core.scan_git_history, repo_path, max_commits, all_branches, max_findings)
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -183,6 +212,7 @@ def scan_git_range(
     base: str = "@{upstream}",
     head: str = "HEAD",
     max_commits: int = 200,
+    max_findings: int = core.DEFAULT_MAX_FINDINGS,
 ) -> dict:
     """Scan the commits in base..head: by default, what `git push` would send.
 
@@ -196,12 +226,16 @@ def scan_git_range(
         base: Commits reachable from here are excluded (default "@{upstream}").
         head: Last commit to include (default "HEAD").
         max_commits: Scan at most this many of the newest commits in the range.
+        max_findings: List at most this many findings, most severe first
+            (default 200, 0 = no limit). When capped, the result adds
+            truncated, total_findings, counts_by_severity, counts_by_pattern
+            and top_files.
 
     Returns:
         The standard redacted findings report with a "commit" field on each
         finding, plus "commits_scanned" and "range".
     """
-    return _call(core.scan_git_range, repo_path, base, head, max_commits)
+    return _call(core.scan_git_range, repo_path, base, head, max_commits, max_findings)
 
 
 @mcp.tool(annotations=_READ_ONLY)

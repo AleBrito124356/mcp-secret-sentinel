@@ -1,0 +1,12 @@
+- id: secret-sentinel
+  name: secret-sentinel (staged lines)
+  description: >-
+    Blocks the commit while its staged lines contain API keys, tokens, private
+    keys or passwords. Only the lines being committed are scanned, and
+    findings are always redacted.
+  entry: mcp-secret-sentinel scan --staged
+  language: python
+  pass_filenames: false
+  require_serial: true
+  stages: [pre-commit, manual]
+  minimum_pre_commit_version: "3.2.0"
