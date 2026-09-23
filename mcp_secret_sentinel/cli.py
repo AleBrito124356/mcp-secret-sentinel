@@ -394,7 +394,8 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.output).write_text(render(result, args.format, ascii_only=False), encoding="utf-8")
             print(result["summary"], file=sys.stderr)
         else:
-            _write(render(result, args.format, ascii_only=True if args.format != "text" else False))
+            # JSON and SARIF on stdout are pure ASCII, so no console code page can break them.
+            _write(render(result, args.format, ascii_only=args.format != "text"))
         return status
     except (UsageError, ValueError) as exc:
         print(f"mcp-secret-sentinel: error: {exc}", file=sys.stderr)

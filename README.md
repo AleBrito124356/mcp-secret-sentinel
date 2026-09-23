@@ -95,7 +95,7 @@ Each candidate value is checked against these placeholder heuristics before bein
 - **Variable references** — a value that is only `$UPPER_CASE_VAR`, `$(command)`, PowerShell `$env:VAR` or cmd `%VAR%`. `$ecretP4ss` is still a password.
 - **Format placeholders** — a value that is only `%(name)s` or `{name}`.
 - **Environment lookups** — values referencing `os.environ` or `process.env`: an environment lookup is the fix, not the leak.
-- **Code, for generic assignments only** — `API_SECRET = os.getenv("API_SECRET")`, `DB_PASSWORD = settings.DATABASE_PASSWORD`, `HOOK = SECRETS[0]` or one side of `"password='" + pwd + "'"`. The rule is narrow on purpose (`"Xk9(pq!2Lm"` is still a password) and never applies to vendor formats such as JWTs, which contain dots.
+- **Code, for generic assignments only** — `API_SECRET = os.getenv("API_SECRET")`, `DB_PASSWORD = settings.DATABASE_PASSWORD`, `API_TOKEN = SECRETS[0]` or one side of `"password='" + pwd + "'"`. The rule is narrow on purpose (`"Xk9(pq!2Lm"` is still a password) and never applies to vendor formats such as JWTs, which contain dots.
 - **Reserved documentation hosts** — a credentialed URL pointing at `example.com` / `.net` / `.org`, `*.example` or `*.invalid`.
 
 ### Inline suppression
@@ -218,7 +218,7 @@ Found 2 potential secret(s) across 2 scanned file(s): 1 critical, 1 high. Do NOT
 | `--max-commits N` | With `--range`: scan at most the N newest commits (default 200) |
 | `-o, --output FILE` | Write the report to a file; the one-line summary goes to stderr |
 
-**Exit status:** `0` clean (or only findings below `--fail-on`), `1` findings at or above `--fail-on`, `2` usage error (bad option, missing path, not a git repository, unknown revision). Paths in the report are relative to the working directory, which is what editors and SARIF viewers expect. Output is redacted in every format.
+**Exit status:** `0` clean (or only findings below `--fail-on`), `1` findings at or above `--fail-on`, `2` usage error (bad option, missing path, not a git repository, unknown revision). Paths in the report are relative to the working directory, which is what editors and SARIF viewers expect. With `--staged`, `--range` and `--history` they are relative to the repository root. Output is redacted in every format.
 
 ### Block commits with a git hook
 
