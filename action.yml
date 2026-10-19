@@ -1,0 +1,104 @@
+name: "Secret Sentinel scan"
+description: "Scan a repository, a push or a pull request for exposed secrets (64 detectors, base64-aware, redacted SARIF)."
+author: "Alejandro Brito"
+branding:
+  icon: "shield"
+  color: "red"
+
+inputs:
+  path:
+    description: "Directory or file to scan (ignored when 'range' is set)."
+    default: "."
+  range:
+    description: "Scan only the commits in BASE..HEAD instead of the tree, e.g. 'origin/main..HEAD'. Needs fetch-depth: 0."
+    default: ""
+  fail-on:
+    description: "Lowest severity that fails the step: critical, high or medium."
+    default: "high"
+  sarif:
+    description: "Upload the findings to GitHub code scanning (needs security-events: write)."
+    default: "true"
+  version:
+    description: "mcp-secret-sentinel version to run (a PyPI version, or 'local' for the action's own checkout)."
+    default: "local"
+  use-config:
+    description: >-
+      Honour the repository's .secret-sentinel.toml and baseline. A pull request can edit those
+      files too: pass "false" on pull_request events from untrusted contributors.
+    default: "true"
+
+outputs:
+  sarif-file:
+    description: "Path of the SARIF report."
+    value: ${{ steps.scan.outputs.sarif-file }}
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install mcp-secret-sentinel
+      shell: bash
+      env:
+        SENTINEL_VERSION: ${{ inputs.version }}
+      run: |
+        if [ "$SENTINEL_VERSION" = "local" ]; then
+          python -m pip install --quiet "$GITHUB_ACTION_PATH"
+        else
+          python -m pip install --quiet "mcp-secret-sentinel==$SENTINEL_VERSION"
+        fi
+
+    - name: Scan
+      id: scan
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+        SCAN_RANGE: ${{ inputs.range }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        USE_CONFIG: ${{ inputs.use-config }}
+      run: |
+        report="$RUNNER_TEMP/secret-sentinel.sarif"
+        echo "sarif-file=$report" >> "$GITHUB_OUTPUT"
+        if [ -n "$SCAN_RANGE" ]; then
+          target=(--range "$SCAN_RANGE")
+        else
+          target=("$SCAN_PATH")
+        fi
+        if [ "$USE_CONFIG" != "true" ]; then
+          target+=(--no-config)
+        fi
+        set +e
+        mcp-secret-sentinel scan "${target[@]}" --format sarif -o "$report" --fail-on "$FAIL_ON" 2> "$RUNNER_TEMP/secret-sentinel.err"
+        status=$?
+        set -e
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+        if [ "$status" -ge 2 ]; then
+          # A usage error (bad range, shallow clone, broken config): no report was written.
+          cat "$RUNNER_TEMP/secret-sentinel.err" >&2
+          echo "### Secret Sentinel: the scan could not run" >> "$GITHUB_STEP_SUMMARY"
+          sed 's/^/    /' "$RUNNER_TEMP/secret-sentinel.err" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+        fi
+        mcp-secret-sentinel scan "${target[@]}" --fail-on "$FAIL_ON" > "$RUNNER_TEMP/secret-sentinel.txt" || true
+        {
+          echo "### Secret Sentinel"
+          echo '```'
+          tail -n 60 "$RUNNER_TEMP/secret-sentinel.txt"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload SARIF
+      if: ${{ always() && inputs.sarif == 'true' && (steps.scan.outputs.status == '0' || steps.scan.outputs.status == '1') }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif-file }}
+        category: secret-sentinel
+
+    - name: Fail on findings
+      if: ${{ steps.scan.outputs.status == '1' }}
+      shell: bash
+      run: |
+        echo "Secret Sentinel found secrets at or above the fail-on level. See the job summary or the code scanning alerts."
+        exit 1

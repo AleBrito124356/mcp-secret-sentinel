@@ -4,15 +4,19 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-secret-sentinel"
-version = "0.2.0"
-description = "MCP server and CLI that scans code for exposed secrets — API keys, tokens, private keys and high-entropy strings — with placeholder-aware allowlisting and redacted reports."
+version = "0.3.0"
+description = "Local secret guardrails for AI coding agents: MCP server, CLI and agent hooks that catch API keys in code, commits, prompts, tool calls and MCP configs, with redacted reports."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Alejandro Brito", email = "alejandrobritoolivera@gmail.com"}]
-keywords = ["mcp", "model-context-protocol", "claude", "ai-agents", "security", "secrets-detection", "devsecops"]
+keywords = [
+    "mcp", "model-context-protocol", "claude", "claude-code", "cursor", "ai-agents",
+    "agent-hooks", "security", "secrets-detection", "secret-scanning", "devsecops", "sarif",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -21,12 +25,18 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Quality Assurance",
     "Topic :: Security",
 ]
 # 1.7 is the first SDK with tool annotations; 2.x renamed FastMCP to
 # MCPServer, which server.py handles. Capped below the next untested major.
-dependencies = ["mcp>=1.7,<3"]
+# typing_extensions comes with mcp (through pydantic); it is listed because
+# server.py imports it directly. tomli reads .secret-sentinel.toml before 3.11.
+dependencies = [
+    "mcp>=1.7,<3",
+    "typing_extensions>=4.6",
+    "tomli>=1.1; python_version < '3.11'",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
@@ -35,12 +45,16 @@ dev = ["pytest>=8.0"]
 Homepage = "https://github.com/AleBrito124356/mcp-secret-sentinel"
 Source = "https://github.com/AleBrito124356/mcp-secret-sentinel"
 Issues = "https://github.com/AleBrito124356/mcp-secret-sentinel/issues"
+Changelog = "https://github.com/AleBrito124356/mcp-secret-sentinel/blob/main/CHANGELOG.md"
 
 [project.scripts]
 mcp-secret-sentinel = "mcp_secret_sentinel.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mcp_secret_sentinel"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [".venv*", ".pytest_cache", "dist"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
