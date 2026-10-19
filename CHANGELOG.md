@@ -4,7 +4,38 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] — Unreleased
+## [0.3.0] — 2026-10-19
+
+Agent guardrails: the scanner now sits where AI coding agents handle
+secrets, not only at commit time.
+
+### Added
+
+- **Agent hooks** (`mcp-secret-sentinel hook`) for Claude Code, Codex and Cursor. `PreToolUse` denies `Write` / `Edit` / `MultiEdit` / `NotebookEdit` / `Bash` / `mcp__*` calls whose content, command or arguments carry a secret, with a redacted reason and the fix. Writes to git-ignored files (a local `.env`) and files outside any repository are allowed; a tracked `.env` is still protected. `UserPromptSubmit` blocks a prompt with a secret and sets `suppressOriginalPrompt`. `PostToolUse` returns `updatedToolOutput` with every secret in the tool's output replaced, keeping the output's shape. Cursor's `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile` and `beforeSubmitPrompt` are handled too. Defaults to blocking `high` and above (`--fail-on`), honours config excludes, exempts the server's own tools and fails open on anything unexpected.
+- `install-agent-hooks --agent claude|cursor [--scope project|local|user]` merges the hooks into the agent's settings, idempotently and without touching other hooks.
+- **Claude Code plugin and marketplace** (`.claude-plugin/`): one `/plugin install` brings the skill, the hooks (run from the checkout by a POSIX launcher, stdlib only) and the MCP server (`uvx --from` the plugin directory).
+- **Agent skill** (`skills/secret-sentinel/`, agentskills.io format): when to scan, how to write credential lookups, how to fix a finding, plus references for rotating 40+ credential types, cleaning git history and keeping keys out of each MCP client's config.
+- **`scan_agent_configs`** tool and `agents` command: audits the MCP client and agent files of the project (`.mcp.json`, `.claude/settings*.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, `.gemini/`, `.codex/`, CLAUDE.md, AGENTS.md, .cursorrules...) and of the user (Claude Code, Claude Desktop, Cursor, VS Code, Cline, Windsurf, Gemini CLI, Codex, Kiro, Continue, Zed...), optionally session transcripts. Project files report whether git tracks them, and files with findings carry a client-specific hint for referencing the environment.
+- **`redact_text`** tool and `redact` command: the text with every secret replaced by `[REDACTED:<detector>]`, everything else byte-for-byte (line endings included).
+- **31 new detectors** (64 in total), from the gitleaks, betterleaks and trufflehog rule sets: xAI, DeepSeek-style `sk-<hex>`, Perplexity, Replicate, Together AI, Cerebras, AWS Bedrock API keys, LangSmith, Langfuse, Pinecone, Firecrawl, Tavily, Supabase (`sb_secret_`, `sbp_`), Vercel, Cloudflare, HashiCorp Vault, Doppler, Databricks, Grafana, Sentry, Atlassian, Linear, Notion, Postman, PlanetScale, Neon, Fly.io, Resend, Mailchimp, PostHog and Square.
+- **Base64 decoding**: base64 runs (standard or URL-safe) that decode to printable text are scanned again, one level deep, so secrets in Kubernetes Secret manifests, Basic auth headers or encoded PEM keys are found. Findings are named `<detector> (base64)`, and `redact_text` masks the whole encoded run.
+- **Project configuration**: `.secret-sentinel.toml` or `[tool.secret-sentinel]` in `pyproject.toml`, found upwards from the scanned path to the repository root, with `exclude_paths` (globs with `**`), `allowlist` regexes, `disable`d detectors and custom `[[rules]]`. Strict validation: unknown keys, detector names and bad regexes are errors. `init` writes a commented starter file. Applies to the CLI, the MCP tools and the hooks.
+- **Baselines**: `baseline` records salted PBKDF2 fingerprints of reviewed findings; later scans report only new secrets and count the rest in `baselined`. Location-independent, so accepted values survive refactors. `scan --baseline FILE`, `--config FILE` and `--no-config` control it.
+- **Structured output**: the scan tools declare typed results, so MCP SDK 1.10+ / 2.x publish an `outputSchema` and return `structuredContent`.
+- MCP prompts `pre_push_check`, `leak_response` and `audit_agent_configs`, and a `secret-sentinel://patterns` resource.
+- **GitHub Action** (`action.yml`): scans the tree or a commit range, uploads redacted SARIF to code scanning, writes the report to the job summary and fails on findings at or above `fail-on`.
+- gitleaks' `gitleaks:allow` inline marker is honoured, like `secret-sentinel: ignore` and `pragma: allowlist secret`.
+- Hardening from a pre-release review: `redact_text` (and the `PostToolUse` hook) removes a private key as a whole block, header to footer, including JSON-escaped keys and keys with no footer; the hook reads its event as UTF-8 regardless of the Windows code page, covers Claude Code's `PowerShell` tool, keeps scanning when git fails for a reason other than "not a repository", answers `"ask"` to edits of the scanner's own config and baseline, and exits 1 (never 2) on internal errors; `scan_directory` walks a folder git ignores and nested repositories instead of reporting them clean; base64 runs right after `=` and up to 20,000 characters are decoded; `baseline` writes where scans read it; reinstalling agent hooks keeps other hooks that share a matcher group; the action separates scan errors from findings and has a `use-config` input for untrusted pull requests.
+- CI runs on Linux, Windows and macOS, Python 3.10 to 3.13, both MCP SDK majors, plus a self-scan with the action.
+
+### Changed
+
+- **`scan_directory` inside a git work tree lists files with git** (tracked plus untracked, not ignored), so every `.gitignore` level, negations, `.git/info/exclude` and the global excludes file are honoured exactly. Outside git it walks the tree as before.
+- Three new allowlist rules for generic assignments and the entropy check: values shaped like a regular expression (hook matchers, token patterns), plain links without credentials, query or fragment, and filesystem paths (Windows, UNC, home-relative and plain /rooted paths), which a real audit of agent configs showed to be the main source of entropy false positives.
+- The suppression note in summaries no longer lists the markers.
+- Dependencies: `typing_extensions` (already installed with mcp) is declared, and `tomli` on Python 3.10 for the configuration file.
+
+## [0.2.0] — 2026-09-23 (merged to main, never published to PyPI)
 
 ### Fixed
 
@@ -52,3 +83,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 65 tests covering every detector, the allowlist, entropy math, redaction, directory walking and real temporary git repositories — with no realistic secret literal anywhere in the suite (every positive fixture is assembled at runtime by concatenation).
 
 [0.1.0]: https://github.com/AleBrito124356/mcp-secret-sentinel/releases/tag/v0.1.0
+[0.3.0]: https://github.com/AleBrito124356/mcp-secret-sentinel/releases/tag/v0.3.0
