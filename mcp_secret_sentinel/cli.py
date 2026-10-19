@@ -7,6 +7,12 @@
     mcp-secret-sentinel scan --range         scan what the next push would publish
     mcp-secret-sentinel scan --history N     scan the last N commits
     mcp-secret-sentinel install-hook [REPO]  block commits that add secrets
+    mcp-secret-sentinel redact [FILE|-]      print text with every secret masked
+    mcp-secret-sentinel agents [PROJECT]     audit AI agent / MCP client configs
+    mcp-secret-sentinel hook                 answer one agent hook event (stdin JSON)
+    mcp-secret-sentinel install-agent-hooks  wire the hook into Claude Code or Cursor
+    mcp-secret-sentinel baseline [PATH ...]  accept the current findings
+    mcp-secret-sentinel init                 write a starter .secret-sentinel.toml
     mcp-secret-sentinel patterns             list detectors and allowlist rules
 
 ``scan`` exits 0 when clean, 1 when a finding reaches --fail-on, and 2 on
@@ -25,6 +31,7 @@ import sys
 from pathlib import Path
 
 from . import __version__, core
+from . import config as cfg
 
 EXIT_CLEAN = 0
 EXIT_FINDINGS = 1
@@ -131,6 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"stop a directory scan after N files (default {CLI_MAX_FILES})",
     )
     scan.add_argument("-o", "--output", metavar="FILE", help="write the report to FILE instead of stdout")
+    _add_config_options(scan)
 
     hook = sub.add_parser(
         "install-hook",
@@ -150,9 +158,108 @@ def build_parser() -> argparse.ArgumentParser:
         help="lowest severity that blocks the commit (default medium)",
     )
 
+    redact = sub.add_parser(
+        "redact",
+        help="print a file or stdin with every secret replaced by [REDACTED:<detector>]",
+        description="Mask secrets in logs, configs or diffs before sharing them (with a model, in an issue...).",
+    )
+    redact.add_argument("file", nargs="?", default="-", help="file to redact (default: stdin)")
+    redact.add_argument("-o", "--output", metavar="FILE", help="write the redacted text to FILE")
+    _add_config_options(redact)
+
+    agents = sub.add_parser(
+        "agents",
+        help="audit AI agent and MCP client configs for hardcoded secrets",
+        description=(
+            "Scan MCP client configs (Claude Code, Claude Desktop, Cursor, VS Code, Windsurf, "
+            "Gemini CLI, Codex...), agent instruction files and optionally session transcripts."
+        ),
+    )
+    agents.add_argument("project", nargs="?", default=".", help="project directory (default: .)")
+    agents.add_argument("--no-user", action="store_true", help="skip the configs in your home folder")
+    agents.add_argument("--transcripts", action="store_true", help="also scan agent session transcripts")
+    agents.add_argument("--format", choices=("text", "json"), default="text")
+    agents.add_argument(
+        "--fail-on", choices=tuple(_FAIL_RANK), default="medium",
+        help="lowest severity that makes the exit status 1 (default medium)",
+    )
+
+    hook_cmd = sub.add_parser(
+        "hook",
+        help="answer one AI agent hook event read as JSON on stdin (Claude Code, Codex, Cursor)",
+        description=(
+            "Blocks tool calls and prompts that carry a secret and redacts secrets from tool "
+            "output. Prints the agent's decision JSON; prints nothing when there is no objection."
+        ),
+    )
+    hook_cmd.add_argument(
+        "--fail-on", choices=tuple(_FAIL_RANK), default="high",
+        help="lowest severity that blocks (default high: JWTs and entropy hits pass)",
+    )
+
+    agent_hooks = sub.add_parser(
+        "install-agent-hooks",
+        help="add the agent hook to Claude Code or Cursor settings",
+        description=(
+            "Merge the secret-sentinel hook into an agent's settings file, keeping every other "
+            "setting. Claude Code: PreToolUse, UserPromptSubmit and PostToolUse. Cursor: "
+            "beforeSubmitPrompt, beforeShellExecution, beforeMCPExecution and beforeReadFile."
+        ),
+    )
+    agent_hooks.add_argument("--agent", choices=("claude", "cursor"), required=True)
+    agent_hooks.add_argument(
+        "--scope", choices=("project", "local", "user"), default="project",
+        help="project settings (shared), local (Claude Code, untracked) or user (default project)",
+    )
+    agent_hooks.add_argument("project", nargs="?", default=".", help="project directory (default: .)")
+
+    baseline = sub.add_parser(
+        "baseline",
+        help="write a baseline that accepts the current findings",
+        description=(
+            "Scan and store a non-reversible fingerprint of every finding, so later scans only "
+            "report new secrets. Review the findings first: a baseline is an acceptance."
+        ),
+    )
+    baseline.add_argument("paths", nargs="*", metavar="PATH", help="files or directories (default: .)")
+    baseline.add_argument(
+        "-o", "--output", metavar="FILE", default=None,
+        help=(
+            "baseline file to write (default: the config's 'baseline' path, else "
+            f"{cfg.BASELINE_FILENAME} at the project root, where scans look for it)"
+        ),
+    )
+    baseline.add_argument("--max-files", type=_count(1), default=CLI_MAX_FILES, metavar="N")
+    baseline.add_argument("--config", metavar="FILE", help="configuration file (default: discovered)")
+    baseline.add_argument("--no-config", action="store_true", help="ignore configuration files")
+
+    init = sub.add_parser("init", help=f"write a commented starter {cfg.CONFIG_FILENAME}")
+    init.add_argument("directory", nargs="?", default=".", help="where to write it (default: .)")
+    init.add_argument("--force", action="store_true", help="overwrite an existing file")
+
     patterns = sub.add_parser("patterns", help="list the detectors, allowlist rules and suppression markers")
     patterns.add_argument("--format", choices=("text", "json"), default="text")
     return parser
+
+
+def _add_config_options(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--config", metavar="FILE",
+        help=f"configuration file (default: the nearest {cfg.CONFIG_FILENAME} or [tool.secret-sentinel])",
+    )
+    command.add_argument("--no-config", action="store_true", help="ignore configuration files and baselines")
+    command.add_argument("--baseline", metavar="FILE", help="accept the findings recorded in FILE")
+
+
+def resolve_config(args: argparse.Namespace, start) -> core.ScanConfig:
+    """The ScanConfig for a command: --no-config, --config FILE, or discovery
+    from the scanned path."""
+    if getattr(args, "no_config", False):
+        return core.DEFAULT_CONFIG
+    baseline = getattr(args, "baseline", None)
+    if getattr(args, "config", None):
+        return cfg.load_config(args.config, baseline)
+    return cfg.discover(start if start is not None else Path.cwd(), baseline)
 
 
 # ---------------------------------------------------------------------------
@@ -199,24 +306,27 @@ def run_scan(args: argparse.Namespace) -> dict:
         if len(args.paths) > 1:
             raise UsageError("--staged, --range and --history take a single repository path")
         repo = args.paths[0] if args.paths else "."
+        config = resolve_config(args, repo)
         if args.staged:
-            return core.scan_git_staged(repo, max_findings)
+            return core.scan_git_staged(repo, max_findings, config)
         if args.history is not None:
-            return core.scan_git_history(repo, args.history, args.all_branches, max_findings)
+            return core.scan_git_history(repo, args.history, args.all_branches, max_findings, config)
         base, head = _parse_range(args.git_range)
-        return core.scan_git_range(repo, base, head, args.max_commits, max_findings)
+        return core.scan_git_range(repo, base, head, args.max_commits, max_findings, config)
 
+    paths = args.paths or ["."]
+    config = resolve_config(args, next((p for p in paths if p != "-"), None))
     results = []
-    for raw in args.paths or ["."]:
+    for raw in paths:
         if raw == "-":
-            results.append(core.scan_text(sys.stdin.read(), "<stdin>", 0))
+            results.append(core.scan_text(sys.stdin.read(), "<stdin>", 0, config))
             continue
         target = Path(raw).expanduser()
         if target.is_dir():
-            result = core.scan_directory(str(target), args.max_files, 0)
+            result = core.scan_directory(str(target), args.max_files, 0, config)
             results.append(_rebase(result, lambda rel, base=target: _display_path(base / rel)))
         elif target.is_file():
-            result = core.scan_file(str(target), 0)
+            result = core.scan_file(str(target), 0, config)
             results.append(_rebase(result, lambda name: _display_path(Path(name))))
         else:
             raise UsageError(f"no such file or directory: {raw}")
@@ -339,6 +449,127 @@ def format_patterns(info: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# redact, agents, baseline, init
+# ---------------------------------------------------------------------------
+
+
+def _cmd_hook(args: argparse.Namespace) -> int:
+    """Agents send UTF-8 JSON whatever the console code page is, and a hook
+    must never block by accident: exit 2 means "deny" to Claude Code and
+    Cursor, so any internal error exits 1 with nothing on stdout (a
+    non-blocking error the agent shows and moves past)."""
+    from .hooks import run as run_hook
+
+    try:
+        event_text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+        decision = run_hook(event_text, args.fail_on)
+    except Exception as exc:  # noqa: BLE001 - fail open, but say why
+        print(f"secret-sentinel hook error (not blocking): {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_FINDINGS
+    _write(decision)
+    return EXIT_CLEAN
+
+
+def _cmd_redact(args: argparse.Namespace) -> int:
+    if args.file == "-":
+        text = sys.stdin.read()
+        config = resolve_config(args, None)
+    else:
+        target = Path(args.file).expanduser()
+        if not target.is_file():
+            raise UsageError(f"no such file: {args.file}")
+        text, reason = core.decode_bytes(target.read_bytes())
+        if text is None:
+            raise UsageError(f"cannot redact {args.file}: {reason}")
+        config = resolve_config(args, target)
+    result = core.redact_text(text, config)
+    if args.output:
+        Path(args.output).write_text(result["text"], encoding="utf-8", newline="")
+    else:
+        # Bytes, not text mode: line endings must come out exactly as they went in.
+        sys.stdout.flush()
+        sys.stdout.buffer.write(result["text"].encode("utf-8"))
+        sys.stdout.buffer.flush()
+    print(f"secret-sentinel: {result['redactions']} secret(s) redacted.", file=sys.stderr)
+    return EXIT_CLEAN
+
+
+def format_agents(result: dict) -> str:
+    lines = []
+    for entry in result.get("agent_files", []):
+        tracked = " (tracked by git)" if entry.get("tracked_by_git") else ""
+        status = f"{entry['findings']} finding(s)" if entry["findings"] else "clean"
+        lines.append(f"{entry['path']}  [{entry['client']}, {entry['scope']}]{tracked}  {status}")
+    body = format_text(result)
+    hints = sorted({e["hint"] for e in result.get("agent_files", []) if e.get("hint")})
+    if hints:
+        body += "\nHow to fix:\n" + "".join(f"  - {h}\n" for h in hints)
+    return ("\n".join(lines) + "\n\n" if lines else "") + body
+
+
+def _cmd_agents(args: argparse.Namespace) -> int:
+    from .agents import scan_agent_configs
+
+    project = Path(args.project).expanduser()
+    if not project.is_dir():
+        raise UsageError(f"no such directory: {args.project}")
+    result = scan_agent_configs(
+        str(project), include_user=not args.no_user, include_transcripts=args.transcripts, max_findings=0
+    )
+    if args.format == "json":
+        _write(json.dumps(result, indent=2, ensure_ascii=True) + "\n")
+    else:
+        _write(format_agents(result))
+    return exit_status(result, args.fail_on)
+
+
+def _cmd_baseline(args: argparse.Namespace) -> int:
+    import dataclasses
+
+    paths = args.paths or ["."]
+    if args.no_config:
+        config = core.DEFAULT_CONFIG
+    elif args.config:
+        config = cfg.load_config(args.config)
+    else:
+        config = cfg.discover(paths[0])
+    # Record every finding, including the ones an older baseline accepted.
+    config = dataclasses.replace(config, baseline=frozenset(), fingerprints=True)
+    findings = []
+    for raw in paths:
+        target = Path(raw).expanduser()
+        if target.is_dir():
+            result = core.scan_directory(str(target), args.max_files, 0, config)
+            findings += _rebase(result, lambda rel, base=target: _display_path(base / rel))["findings"]
+        elif target.is_file():
+            result = core.scan_file(str(target), 0, config)
+            findings += _rebase(result, lambda name: _display_path(Path(name)))["findings"]
+        else:
+            raise UsageError(f"no such file or directory: {raw}")
+    if args.output:
+        output = Path(args.output)
+    elif args.config and config.baseline_path is not None:
+        output = config.baseline_path
+    else:
+        output = cfg.default_baseline_path(paths[0])
+    count = cfg.write_baseline(output, findings)
+    _write(
+        f"Wrote {count} accepted finding(s) to {_display_path(output)}. Later scans report "
+        "only secrets that are not in it. Commit the file: it holds fingerprints, never values.\n"
+    )
+    return EXIT_CLEAN
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    target = Path(args.directory).expanduser() / cfg.CONFIG_FILENAME
+    if target.exists() and not args.force:
+        raise UsageError(f"{target.as_posix()} already exists (use --force to overwrite)")
+    target.write_text(cfg.STARTER_CONFIG, encoding="utf-8", newline="\n")
+    _write(f"Wrote {target.as_posix()}.\n")
+    return EXIT_CLEAN
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -378,6 +609,23 @@ def main(argv: list[str] | None = None) -> int:
             info = core.list_patterns()
             _write(json.dumps(info, indent=2) + "\n" if args.format == "json" else format_patterns(info))
             return EXIT_CLEAN
+        if args.command == "redact":
+            return _cmd_redact(args)
+        if args.command == "agents":
+            return _cmd_agents(args)
+        if args.command == "hook":
+            return _cmd_hook(args)
+        if args.command == "install-agent-hooks":
+            from .hooks import install_agent_hooks, settings_file
+
+            target = settings_file(args.agent, args.scope, Path(args.project).resolve(), Path.home())
+            install_agent_hooks(args.agent, target)
+            _write(f"Added the secret-sentinel hooks to {target.as_posix()}.\n")
+            return EXIT_CLEAN
+        if args.command == "baseline":
+            return _cmd_baseline(args)
+        if args.command == "init":
+            return _cmd_init(args)
         if args.command == "install-hook":
             target = install_hook(args.repo, args.force, args.fail_on)
             _write(

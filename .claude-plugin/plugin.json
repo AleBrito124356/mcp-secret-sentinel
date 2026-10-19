@@ -1,0 +1,19 @@
+{
+  "name": "secret-sentinel",
+  "version": "0.3.0",
+  "description": "Local secret guardrails for AI agents: blocks API keys in file writes, shell commands, MCP calls and prompts, redacts them from tool output, audits MCP client configs and scans staged changes, pushes and history. No account, nothing leaves the machine.",
+  "author": {
+    "name": "Alejandro Brito",
+    "url": "https://github.com/AleBrito124356"
+  },
+  "homepage": "https://github.com/AleBrito124356/mcp-secret-sentinel",
+  "repository": "https://github.com/AleBrito124356/mcp-secret-sentinel",
+  "license": "MIT",
+  "keywords": ["security", "secrets", "secret-scanning", "api-keys", "guardrails", "hooks", "mcp", "devsecops"],
+  "mcpServers": {
+    "secret-sentinel": {
+      "command": "uvx",
+      "args": ["--from", "${CLAUDE_PLUGIN_ROOT}", "mcp-secret-sentinel"]
+    }
+  }
+}

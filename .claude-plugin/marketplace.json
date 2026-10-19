@@ -1,0 +1,20 @@
+{
+  "name": "secret-sentinel",
+  "owner": {
+    "name": "Alejandro Brito",
+    "url": "https://github.com/AleBrito124356"
+  },
+  "metadata": {
+    "description": "Local secret guardrails for AI coding agents."
+  },
+  "plugins": [
+    {
+      "name": "secret-sentinel",
+      "source": "./",
+      "description": "Blocks secrets in agent tool calls and prompts, redacts them from tool output, audits MCP configs and scans git changes. Local only.",
+      "version": "0.3.0",
+      "category": "security",
+      "keywords": ["security", "secrets", "hooks", "mcp"]
+    }
+  ]
+}

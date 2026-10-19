@@ -42,8 +42,12 @@ EXPECTED_TOOLS = {
     "scan_git_staged",
     "scan_git_history",
     "scan_git_range",
+    "scan_agent_configs",
+    "redact_text",
     "list_patterns",
 }
+EXPECTED_PROMPTS = {"pre_push_check", "leak_response", "audit_agent_configs"}
+STRUCTURED_TOOLS = EXPECTED_TOOLS - {"list_patterns"}
 RAW_SECRETS = [GENERIC_VALUE, SLACK_HOOK_SECRET, STRIPE_SECRET, TWILIO_KEY]
 
 
@@ -93,6 +97,12 @@ def session(tmp_path_factory):
     plain = work / "plain"
     plain.mkdir()
 
+    agent_project = work / "agent-project"
+    agent_project.mkdir()
+    (agent_project / ".mcp.json").write_text(
+        '{"mcpServers": {"pay": {"env": {"STRIPE_KEY": "' + STRIPE_SECRET + '"}}}}\n', encoding="utf-8"
+    )
+
     calls = {
         "scan_text": ("scan_text", {"text": "x = 1\n" + GENERIC_LINE, "source_name": "snippet.py"}),
         "scan_file": ("scan_file", {"path": str(secret_file)}),
@@ -106,6 +116,11 @@ def session(tmp_path_factory):
             {"text": "\n".join([GENERIC_LINE, SLACK_HOOK_LINE, STRIPE_LINE]), "max_findings": 1},
         ),
         "list_patterns": ("list_patterns", {}),
+        "redact_text": ("redact_text", {"text": "ok\n" + STRIPE_LINE + "\nend"}),
+        "scan_agent_configs": (
+            "scan_agent_configs",
+            {"project_path": str(agent_project), "include_user": False},
+        ),
         "missing_file": ("scan_file", {"path": str(work / "missing.txt")}),
         "not_a_repo": ("scan_git_staged", {"repo_path": str(plain)}),
     }
@@ -131,10 +146,18 @@ async def _drive(args: list, env: dict, work, calls: dict) -> dict:
             async with ClientSession(read, write) as client:
                 init = await client.initialize()
                 tools = await client.list_tools()
+                prompts = await client.list_prompts()
+                resource = await client.read_resource("secret-sentinel://patterns")
                 results = {}
                 for key, (name, arguments) in calls.items():
                     results[key] = await client.call_tool(name, arguments)
-                return {"init": init, "tools": tools.tools, "results": results}
+                return {
+                    "init": init,
+                    "tools": tools.tools,
+                    "prompts": prompts.prompts,
+                    "resource": resource,
+                    "results": results,
+                }
 
 
 def test_initialize_reports_server_and_instructions(session):
@@ -231,8 +254,69 @@ def test_errors_come_back_as_tool_errors_with_the_reason(session):
     assert "Not a git repository" in _text(not_repo)
 
 
+def test_redact_text_over_stdio(session):
+    payload = _payload(session["results"]["redact_text"])
+    assert payload["redactions"] == 1
+    assert payload["text"] == 'ok\nstripe_key = "[REDACTED:Stripe live key]"\nend'
+    assert payload["by_pattern"] == {"Stripe live key": 1}
+
+
+def test_scan_agent_configs_over_stdio(session):
+    payload = _payload(session["results"]["scan_agent_configs"])
+    (finding,) = payload["findings"]
+    assert finding["file"] == "./.mcp.json"
+    assert finding["pattern"] == "Stripe live key"
+    (entry,) = payload["agent_files"]
+    assert entry["client"] == "Claude Code" and entry["scope"] == "project"
+    assert "${" in entry["hint"]
+
+
+def _supports_structured_output() -> bool:
+    major, minor = (int(x) for x in dist_version("mcp").split(".")[:2])
+    return (major, minor) >= (1, 10)
+
+
+def test_scan_tools_publish_an_output_schema(session):
+    if not _supports_structured_output():
+        pytest.skip("structured output needs mcp >= 1.10")
+    tools = {tool.name: tool for tool in session["tools"]}
+    for name in STRUCTURED_TOOLS:
+        schema = _attr(tools[name], "outputSchema", "output_schema")
+        assert schema and schema.get("type") == "object", name
+    report = _attr(tools["scan_text"], "outputSchema", "output_schema")
+    assert {"clean", "findings", "files_scanned", "summary"} <= set(report["required"])
+
+
+def test_structured_content_matches_the_text(session):
+    if not _supports_structured_output():
+        pytest.skip("structured output needs mcp >= 1.10")
+    for key in ("scan_text", "scan_git_range", "scan_agent_configs", "redact_text", "scan_text_capped"):
+        result = session["results"][key]
+        structured = _attr(result, "structuredContent", "structured_content")
+        # mcp 1.x serializes absent optional keys as null; 2.x leaves them out.
+        assert _drop_nulls(structured) == _drop_nulls(_payload(result)), key
+
+
+def _drop_nulls(value):
+    if isinstance(value, dict):
+        return {k: _drop_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_nulls(v) for v in value]
+    return value
+
+
+def test_prompts_and_patterns_resource(session):
+    assert {prompt.name for prompt in session["prompts"]} == EXPECTED_PROMPTS
+    (contents,) = session["resource"].contents
+    data = json.loads(contents.text)
+    assert data["count"] == len(data["patterns"])
+
+
 def test_no_raw_secret_crosses_the_wire(session):
-    wire = "".join(_text(result) for result in session["results"].values())
+    wire = "".join(
+        _text(result) + json.dumps(_attr(result, "structuredContent", "structured_content") or {})
+        for result in session["results"].values()
+    )
     for secret in RAW_SECRETS:
         assert secret not in wire
 

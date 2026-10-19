@@ -28,30 +28,29 @@ def rule_id(pattern_name: str) -> str:
     return f"secret-sentinel/{slug}"
 
 
+def _rule(det: dict) -> dict:
+    return {
+        "id": rule_id(det["name"]),
+        "name": "".join(word.capitalize() for word in re.split(r"[^A-Za-z0-9]+", det["name"]) if word),
+        "shortDescription": {"text": det["name"]},
+        "fullDescription": {"text": f"{det['name']} committed to source."},
+        "help": {"text": det["advice"]},
+        "defaultConfiguration": {"level": _LEVEL[det["severity"]]},
+        "properties": {
+            "tags": ["security", "secret"],
+            "security-severity": _SECURITY_SEVERITY[det["severity"]],
+            "precision": "medium" if det["severity"] == "medium" else "high",
+        },
+    }
+
+
 def _rules() -> list[dict]:
     detectors = [
         {"name": p["name"], "severity": p["severity"], "advice": p["advice"]} for p in core.PATTERNS
     ]
     info = core.list_patterns()["entropy_detector"]
     detectors.append({"name": info["name"], "severity": info["severity"], "advice": info["advice"]})
-    rules = []
-    for det in detectors:
-        rules.append(
-            {
-                "id": rule_id(det["name"]),
-                "name": "".join(word.capitalize() for word in re.split(r"[^A-Za-z0-9]+", det["name"]) if word),
-                "shortDescription": {"text": det["name"]},
-                "fullDescription": {"text": f"{det['name']} committed to source."},
-                "help": {"text": det["advice"]},
-                "defaultConfiguration": {"level": _LEVEL[det["severity"]]},
-                "properties": {
-                    "tags": ["security", "secret"],
-                    "security-severity": _SECURITY_SEVERITY[det["severity"]],
-                    "precision": "medium" if det["severity"] == "medium" else "high",
-                },
-            }
-        )
-    return rules
+    return [_rule(det) for det in detectors]
 
 
 def artifact_uri(path: str) -> str:
@@ -70,6 +69,11 @@ def to_sarif(result: dict) -> dict:
     results = []
     for finding in result["findings"]:
         rid = rule_id(finding["pattern"])
+        if rid not in index:  # a custom rule from the project configuration
+            index[rid] = len(rules)
+            rules.append(
+                _rule({"name": finding["pattern"], "severity": finding["severity"], "advice": finding["advice"]})
+            )
         fingerprint = hashlib.sha256(
             f"{rid}|{finding['file']}|{finding['redacted']}".encode("utf-8")
         ).hexdigest()

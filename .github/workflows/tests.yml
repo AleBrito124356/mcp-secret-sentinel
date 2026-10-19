@@ -10,16 +10,42 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.12", "3.13"]
+        mcp: ["mcp>=2"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.12"
+            mcp: "mcp<2"
+          - os: windows-latest
+            python-version: "3.12"
+            mcp: "mcp>=2"
+          - os: macos-latest
+            python-version: "3.12"
+            mcp: "mcp>=2"
+    name: ${{ matrix.os }} / py${{ matrix.python-version }} / ${{ matrix.mcp }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev]"
+      - run: pip install "${{ matrix.mcp }}" -e ".[dev]"
       - run: python -m pytest -q
       - name: Verify the server module imports
         run: python -c "from mcp_secret_sentinel import server; print('import ok')"
+
+  self-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          fail-on: medium
+          sarif: ${{ github.event_name == 'push' }}
